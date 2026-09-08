@@ -37,6 +37,7 @@ The goal is to use trap-reported counters when available and only infer from BLE
 - `Trap Occupancy` (occupancy class)
 - `USB` (connectivity class)
 - `Tray` (opening class)
+- `Discoverable` (C20 advertisement flag)
 
 ### Core sensors
 
@@ -48,6 +49,7 @@ The goal is to use trap-reported counters when available and only infer from BLE
 - `Serial Number`
 - `Firmware Version`
 - `Battery` (C20 percent, trap-reported)
+- `Device Type` (C20 advertisement value, disabled by default)
 - `Last Kill At` (C20 kill history-derived, diagnostic)
 - `Device` (C20, diagnostic)
 
@@ -55,14 +57,19 @@ The goal is to use trap-reported counters when available and only infer from BLE
 
 - `Poll Now`
 - `Test Fire`
+- `Clear Kill Alert` (C20)
+- `Reset Alert` (A24)
 
 `Test Fire` uses model-specific write paths:
 
 - C20:
   - Nordic UART write to `6E400002...`
   - framed `SetCommandRequest(FIRE)` packet (command id `1049702590`)
+- A24:
+  - writes device control `DE13 = 0x05`
+  - selects the returned kill via `D20D` and reads its `D30D` strike record
 
-`Test Fire` is currently exposed only for C20 devices. A24 manual test-fire behavior has not been confirmed sufficiently to expose safely.
+`Clear Kill Alert` sends the C20 `SetCommandRequest(CLEAR)` command id `1682499629`.
 
 ## Options
 
@@ -75,6 +82,9 @@ No user-configurable runtime options are currently exposed. The integration uses
 - Some fields remain unknown/partially understood; unknown raws are exposed for analysis.
 - Not all protocol paths are guaranteed stable across firmware versions.
 - App UI items like donut life and full activity timeline likely include cloud/server data; BLE alone may not provide all of those derived values.
+- Pairing-key retrieval, firmware transfer, and Memfault diagnostic export are intentionally
+  not exposed: they are provisioning/support flows that require secrets, signed firmware,
+  or an app/cloud upload destination rather than Home Assistant entities.
 
 ## Recommended topology
 
@@ -191,11 +201,12 @@ C20 uses Nordic UART writes (`6E400002`) with framed command packets, including:
 
 Memfault diagnostics also write to a separate characteristic (`54220005...`).
 
-This integration now follows the same C20 connect/poll sequence seen in `btsnoop` captures:
+This integration follows the C20 connect/poll sequence implemented by app 3.2.0:
 
 - subscribe notify on `6E400003`
 - set time (`type 0x04`, subtype `0x02`)
-- request firmware (`0x08`), battery (`0x11`), device state (`0x10`), kill history (`0x14`)
+- request firmware (`0x08`), battery (`0x11`), device state (`0x10`)
+- request striker history with `LogsRequest` (`0x40`, striker-event flag)
 - parse responses (`subtype 0x01`)
 
 From `btsnoop2` (triggering a strike/test-fire action), the flow is:

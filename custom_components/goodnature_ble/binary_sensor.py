@@ -24,8 +24,8 @@ class GoodnatureBinaryStateSpec:
 
     key: str
     name: str
-    device_class: BinarySensorDeviceClass
-    state_fn: Callable[[str | None], bool | None]
+    device_class: BinarySensorDeviceClass | None
+    state_fn: Callable[[str | bool | None], bool | None]
     raw_attr: str
     entity_category: EntityCategory | None = EntityCategory.DIAGNOSTIC
 
@@ -70,6 +70,13 @@ STATE_SPECS: tuple[GoodnatureBinaryStateSpec, ...] = (
         device_class=BinarySensorDeviceClass.OPENING,
         state_fn=lambda raw: None if raw in (None, "NO_DATA", "UNKNOWN") else raw == "OPEN",
         raw_attr="c20_tray_state",
+    ),
+    GoodnatureBinaryStateSpec(
+        key="discoverable",
+        name="Discoverable",
+        device_class=None,
+        state_fn=lambda raw: raw if isinstance(raw, bool) else None,
+        raw_attr="c20_discoverable",
     ),
 )
 

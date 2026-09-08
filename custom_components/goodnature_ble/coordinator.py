@@ -38,6 +38,7 @@ from .protocol import (
     UUIDS,
     decode_text,
     gn_uuid,
+    parse_c20_advertisement,
     parse_d30d,
     parse_u16_le,
     parse_u8,
@@ -64,12 +65,14 @@ NORDIC_UART_TX_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
 MEMFAULT_DIAG_SERVICE_UUID = "54220000-f6a5-4007-a371-722f4ebd8436"
 MFG_GOODNATURE = 0x0059
 C20_COMMAND_FIRE = 1049702590
+C20_COMMAND_CLEAR = 1682499629
 C20_TYPE_SET_TIME = 0x04
 C20_TYPE_FIRMWARE = 0x08
 C20_TYPE_DEVICE_STATE = 0x10
 C20_TYPE_BATTERY_LEVEL = 0x11
 C20_TYPE_SET_COMMAND = 0x12
-C20_TYPE_KILL_HISTORY = 0x14
+C20_TYPE_LOGS = 0x40
+C20_TYPE_LOG_EVENT = 0x45
 C20_TYPE_STRIKER_EVENT = 0x31
 C20_REQUEST_SUBTYPE = 0x00
 C20_RESPONSE_SUBTYPE = 0x01
@@ -144,6 +147,8 @@ class TrapState:
     last_strike_at: datetime | None = None
     last_strike_flags: int | None = None
     c20_battery_percent: int | None = None
+    c20_device_type: int | None = None
+    c20_discoverable: bool | None = None
     c20_device_time: datetime | None = None
     c20_last_kill_at: datetime | None = None
     c20_strike_count: int | None = None
@@ -276,9 +281,32 @@ class GoodnatureCoordinator(DataUpdateCoordinator[None]):
         # Heuristic fallback: C20-like payload shape seen on GN advertisements.
         manufacturer_data = service_info.manufacturer_data or {}
         mfg_payload = manufacturer_data.get(MFG_GOODNATURE)
-        if mfg_payload and len(mfg_payload) >= 4 and not self.state.serial_number:
-            # C20 scanner heuristic derives serial from the first 4 bytes as LE uint32.
-            self.state.serial_number = f"{int.from_bytes(mfg_payload[:4], 'little'):08X}"
+        c20_advertisement = (
+            parse_c20_advertisement(mfg_payload)
+            if "0000600d-0000-1000-8000-00805f9b34fb" in service_uuids
+            else None
+        )
+        if c20_advertisement is not None:
+            self.state.serial_number = c20_advertisement.serial_number
+            self.state.c20_device_type = c20_advertisement.device_type
+            self.state.c20_device_state = (
+                "ACTIVATED" if c20_advertisement.activated else "DEACTIVATED"
+            )
+            self.state.c20_kill_state = (
+                "DETECTED" if c20_advertisement.strikes_available else "CLEARED"
+            )
+            self.state.c20_battery_state = (
+                "LOW" if c20_advertisement.low_battery else "NORMAL"
+            )
+            self.state.c20_charge_state = (
+                "CHARGING" if c20_advertisement.charging else "NOT_CHARGING"
+            )
+            self.state.c20_usb_state = (
+                "CONNECTED" if c20_advertisement.usb_connected else "DISCONNECTED"
+            )
+            self.state.c20_discoverable = c20_advertisement.discoverable
+            self.state.c20_strike_count = c20_advertisement.strike_count
+            self.state.c20_battery_percent = c20_advertisement.battery_percent
 
         if (
             mfg_payload
@@ -417,9 +445,82 @@ class GoodnatureCoordinator(DataUpdateCoordinator[None]):
         if BleakClient is None:
             return False
 
-        if self.state.model_family != MODEL_C20:
-            self.state.last_gatt_error = "Test fire is only supported for C20"
+        if self.state.model_family not in (MODEL_A24, MODEL_C20):
+            self.state.last_gatt_error = "Trap model is not known yet"
             self.async_set_updated_data(None)
+            return False
+
+        if self.state.model_family == MODEL_A24:
+            return await self._async_a24_test_fire()
+
+        return await self._async_c20_set_command(C20_COMMAND_FIRE, action="test_fire")
+
+    async def async_clear_kill(self) -> bool:
+        """Clear the C20 kill alert using the app's CLEAR command."""
+        if self.state.model_family != MODEL_C20:
+            self.state.last_gatt_error = "Clear is only supported for C20"
+            self.async_set_updated_data(None)
+            return False
+        return await self._async_c20_set_command(C20_COMMAND_CLEAR, action="clear")
+
+    async def _async_a24_test_fire(self) -> bool:
+        """Test-fire an A24 using the flow implemented by the mobile app."""
+        async with self._gatt_lock:
+            ble_device = self._async_resolve_ble_device()
+            if ble_device is None:
+                self.state.gatt_failures += 1
+                self.state.last_gatt_error = "BLE device not available"
+                self.async_set_updated_data(None)
+                return False
+
+            client: BleakClient | None = None
+            try:
+                client = await self._async_connect_client(ble_device)
+                if not await self._async_write_char(client, U["DE13"], b"\x05"):
+                    raise RuntimeError("A24 test fire control write failed")
+
+                # The app waits for Kill Displayed, writes that selector back to
+                # D20D, then reads D30D for the generated test strike.
+                await asyncio.sleep(0.5)
+                kill_displayed_raw = await self._async_read_char(client, U["D20D"])
+                if kill_displayed_raw is None:
+                    raise RuntimeError("A24 test fire did not return Kill Displayed")
+                if not await self._async_write_char(
+                    client, U["D20D"], kill_displayed_raw[:2]
+                ):
+                    raise RuntimeError("A24 test strike selection failed")
+                self.state.kill_displayed = parse_u16_le(kill_displayed_raw)
+
+                d30d = await self._async_read_char(client, U["D30D"])
+                d30d_raw, strike_id, strike_at, strike_flags = parse_d30d(d30d)
+                if strike_id is None or strike_at is None:
+                    raise RuntimeError("A24 test fire did not return a strike record")
+                self.state.d30d_raw = d30d_raw
+                self.state.last_strike_id = strike_id
+                self.state.last_strike_at = strike_at
+                self.state.last_strike_flags = strike_flags
+                self.state.last_activation = strike_at or dt_util.utcnow()
+                self.state.last_gatt_poll = dt_util.utcnow()
+                self.state.last_gatt_error = None
+                self.async_set_updated_data(None)
+                return True
+            except Exception as err:  # noqa: BLE001
+                self.state.gatt_failures += 1
+                self.state.last_gatt_error = str(err)
+                self.async_set_updated_data(None)
+                return False
+            finally:
+                if client and client.is_connected:
+                    try:
+                        await client.disconnect()
+                    except Exception as err:  # noqa: BLE001
+                        self.logger.debug(
+                            "Disconnect failed for A24 test fire: %s", err
+                        )
+
+    async def _async_c20_set_command(self, command: int, *, action: str) -> bool:
+        """Send a C20 SetCommandRequest using the app protocol."""
+        if BleakClient is None:
             return False
 
         async with self._gatt_lock:
@@ -443,14 +544,14 @@ class GoodnatureCoordinator(DataUpdateCoordinator[None]):
                     client,
                     queue,
                     C20_TYPE_SET_COMMAND,
-                    payload=C20_COMMAND_FIRE.to_bytes(4, byteorder="little", signed=False),
+                    payload=command.to_bytes(4, byteorder="little", signed=False),
                     request_subtype=C20_SET_TIME_SUBTYPE,
                 )
                 ok = command_response is not None
 
                 if not ok:
                     self.state.gatt_failures += 1
-                    self.state.last_gatt_error = "Test fire command failed"
+                    self.state.last_gatt_error = f"C20 {action} command failed"
                     self.async_set_updated_data(None)
                     return False
 
@@ -495,8 +596,9 @@ class GoodnatureCoordinator(DataUpdateCoordinator[None]):
                         await client.disconnect()
                     except Exception as err:  # noqa: BLE001
                         self.logger.debug(
-                            "Disconnect failed for %s (test_fire): %s",
+                            "Disconnect failed for %s (%s): %s",
                             self.address,
+                            action,
                             err,
                         )
 
@@ -773,18 +875,6 @@ class GoodnatureCoordinator(DataUpdateCoordinator[None]):
         self.state.c20_device_time = self._u32_to_datetime(state_time)
         self.state.c20_battery_percent = payload[4]
 
-    def _apply_c20_kill_history(self, payload: bytes) -> None:
-        """Apply KillHistoryResponse payload (type 0x14)."""
-        if len(payload) < 40:
-            return
-        times: list[int] = []
-        for offset in range(0, 40, 4):
-            value = self._parse_u32_le(payload, offset)
-            if value:
-                times.append(value)
-        self.state.c20_kill_history_raw = payload.hex()
-        self.state.c20_last_kill_at = self._u32_to_datetime(max(times) if times else None)
-
     def _apply_c20_striker_event(self, payload: bytes) -> None:
         """Apply StrikerEvent payload (type 0x31)."""
         if len(payload) < 21:
@@ -843,14 +933,66 @@ class GoodnatureCoordinator(DataUpdateCoordinator[None]):
             if device_state is not None:
                 self._apply_c20_device_state(device_state)
 
-            kill_history = await self._async_c20_request_response(client, queue, C20_TYPE_KILL_HISTORY)
-            if kill_history is not None:
-                self._apply_c20_kill_history(kill_history)
+            await self._async_refresh_c20_history(client, queue)
         finally:
             try:
                 await client.stop_notify(NORDIC_UART_TX_UUID)
             except Exception:  # noqa: BLE001
                 pass
+
+    async def _async_refresh_c20_history(
+        self, client: BleakClient, queue: asyncio.Queue[bytes]
+    ) -> None:
+        """Fetch C20 striker history using the app's LogsRequest flow."""
+        end_seconds = int(dt_util.utcnow().timestamp())
+        start_seconds = (
+            int(self.state.last_gatt_poll.timestamp())
+            if self.state.last_gatt_poll is not None
+            else max(0, end_seconds - 86400)
+        )
+        # FLAG_STRIKER_EVENTS is bit 1 in the app.
+        payload = (
+            start_seconds.to_bytes(4, "little", signed=False)
+            + end_seconds.to_bytes(4, "little", signed=False)
+            + (1 << 1).to_bytes(4, "little", signed=False)
+        )
+        request = self._encode_c20_message(C20_TYPE_LOGS, C20_REQUEST_SUBTYPE, payload)
+        if not await self._async_write_char(client, NORDIC_UART_RX_UUID, request):
+            return
+
+        history_frames: list[str] = []
+        end_at = self.hass.loop.time() + C20_UART_TIMEOUT_SECONDS
+        while True:
+            remaining = end_at - self.hass.loop.time()
+            if remaining <= 0:
+                break
+            try:
+                raw = await asyncio.wait_for(queue.get(), timeout=remaining)
+            except asyncio.TimeoutError:
+                break
+            decoded = self._decode_c20_frame(raw)
+            if decoded is None:
+                continue
+            message_type, subtype, response_payload = decoded
+            if subtype != C20_RESPONSE_SUBTYPE:
+                continue
+            if message_type == C20_TYPE_LOGS:
+                # LogsResponse is the terminator after the streamed LogEvents.
+                break
+            elif message_type == C20_TYPE_LOG_EVENT:
+                nested = self._decode_c20_frame(response_payload)
+                if nested is None:
+                    continue
+                nested_type, nested_subtype, nested_payload = nested
+                if (
+                    nested_type == C20_TYPE_STRIKER_EVENT
+                    and nested_subtype == C20_RESPONSE_SUBTYPE
+                ):
+                    self._apply_c20_striker_event(nested_payload)
+                    history_frames.append(nested_payload.hex())
+
+        if history_frames:
+            self.state.c20_kill_history_raw = ",".join(history_frames)
 
     async def _async_write_char(self, client: BleakClient, uuid: str, value: bytes) -> bool:
         """Write a characteristic safely."""

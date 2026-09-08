@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
 
 from homeassistant.util import dt as dt_util
@@ -79,6 +80,42 @@ GOODNATURE_DISCOVERY_UUIDS = {
     UUIDS["E010"],
     *LEGACY_DISCOVERY_UUIDS,
 }
+
+
+@dataclass(frozen=True, slots=True)
+class C20Advertisement:
+    """Decoded Goodnature C20 manufacturer data."""
+
+    serial_number: str
+    device_type: int
+    activated: bool
+    strikes_available: bool
+    low_battery: bool
+    charging: bool
+    usb_connected: bool
+    discoverable: bool
+    strike_count: int
+    battery_percent: int
+
+
+def parse_c20_advertisement(value: bytes | None) -> C20Advertisement | None:
+    """Parse the 9-byte manufacturer payload used by the C20 app scanner."""
+    if value is None or len(value) != 9:
+        return None
+
+    flags = value[5]
+    return C20Advertisement(
+        serial_number=f"{int.from_bytes(value[0:4], 'little'):08X}",
+        device_type=value[4],
+        activated=bool(flags & 0x01),
+        strikes_available=bool(flags & 0x02),
+        low_battery=bool(flags & 0x08),
+        charging=bool(flags & 0x10),
+        usb_connected=bool(flags & 0x20),
+        discoverable=bool(flags & 0x40),
+        strike_count=int.from_bytes(value[6:8], "little"),
+        battery_percent=value[8],
+    )
 
 
 def decode_text(value: bytes | None) -> str | None:

@@ -62,6 +62,14 @@ SENSOR_SPECS: tuple[GoodnatureSensorSpec, ...] = (
         entity_category=EntityCategory.DIAGNOSTIC,
     ),
     GoodnatureSensorSpec(
+        key="c20_device_type",
+        name="Device Type",
+        value_fn=lambda s: s.c20_device_type,
+        icon="mdi:identifier",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        enabled_by_default=False,
+    ),
+    GoodnatureSensorSpec(
         key="c20_last_kill_at",
         name="Last Kill At",
         value_fn=lambda s: s.c20_last_kill_at,

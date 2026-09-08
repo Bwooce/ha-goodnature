@@ -13,6 +13,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from . import GoodnatureRuntimeData
 from .entity import GoodnatureEntity
 
+MODEL_A24 = "a24"
 MODEL_C20 = "c20"
 
 
@@ -41,7 +42,24 @@ async def async_setup_entry(
                 name="Test Fire",
                 icon="mdi:flash",
                 action=coordinator.async_test_fire,
+                available_fn=lambda: coordinator.state.model_family
+                in (MODEL_A24, MODEL_C20),
+            ),
+            GoodnatureActionButton(
+                coordinator,
+                key="clear_kill",
+                name="Clear Kill Alert",
+                icon="mdi:notification-clear-all",
+                action=coordinator.async_clear_kill,
                 available_fn=lambda: coordinator.state.model_family == MODEL_C20,
+            ),
+            GoodnatureActionButton(
+                coordinator,
+                key="reset_alert",
+                name="Reset Alert",
+                icon="mdi:notification-clear-all",
+                action=coordinator.async_reset_alert,
+                available_fn=lambda: coordinator.state.model_family == MODEL_A24,
             ),
         ]
     )
