@@ -165,6 +165,10 @@ async def test_setup_cleans_name_and_drops_stale_entities(
     }
     assert f"{ADDRESS}_kill_alert" in unique_ids
     assert f"{ADDRESS}_a24_battery_voltage" in unique_ids
+    volts = registry.async_get(
+        registry.async_get_entity_id("sensor", DOMAIN, f"{ADDRESS}_a24_battery_voltage")
+    )
+    assert volts.options["sensor"]["suggested_display_precision"] == 2
     assert f"{ADDRESS}_charge_state" not in unique_ids  # C20-only
     strikes = hass.states.get(
         registry.async_get_entity_id("sensor", DOMAIN, f"{ADDRESS}_estimated_activations")

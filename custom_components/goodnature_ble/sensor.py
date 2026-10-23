@@ -65,6 +65,7 @@ class GoodnatureSensorSpec:
     models: frozenset[str] | None = None
     options: list[str] | None = None
     state_class: SensorStateClass | None = None
+    suggested_display_precision: int | None = None
 
 
 SENSOR_SPECS: tuple[GoodnatureSensorSpec, ...] = (
@@ -101,6 +102,8 @@ SENSOR_SPECS: tuple[GoodnatureSensorSpec, ...] = (
         device_class=SensorDeviceClass.VOLTAGE,
         native_unit_of_measurement=UnitOfElectricPotential.VOLT,
         state_class=SensorStateClass.MEASUREMENT,
+        # One raw step is about 14 mV.
+        suggested_display_precision=2,
         entity_category=EntityCategory.DIAGNOSTIC,
         models=A24_ONLY,
     ),
@@ -292,6 +295,7 @@ class GoodnatureStateSensor(GoodnatureEntity, SensorEntity):
         self._attr_native_unit_of_measurement = spec.native_unit_of_measurement
         self._attr_entity_registry_enabled_default = spec.enabled_by_default
         self._attr_state_class = spec.state_class
+        self._attr_suggested_display_precision = spec.suggested_display_precision
         if spec.options is not None:
             self._attr_options = spec.options
 
