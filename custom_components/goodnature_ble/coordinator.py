@@ -6,6 +6,7 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from typing import Any
 
 from homeassistant.components.bluetooth import (
     BluetoothChange,
@@ -17,10 +18,15 @@ from homeassistant.components.bluetooth import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
+from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
 from .const import (
+    A24_FAILED_SYNC_RETRY_SECONDS,
+    A24_MIN_SYNC_INTERVAL_SECONDS,
+    A24_RECONNECT_GUARD_SECONDS,
+    A24_SYNC_WINDOW_SECONDS,
     CONF_ADDRESS,
     CONF_NAME,
     COORDINATOR_UPDATE_INTERVAL,
@@ -31,17 +37,30 @@ from .const import (
     DEFAULT_GATT_MIN_POLL_SECONDS,
     DEFAULT_MIN_PACKETS_FOR_ACTIVATION,
     DEFAULT_NAME,
-    DEFAULT_SEND_CONTROL_ZERO,
     DEFAULT_WRITE_TIME_ON_CONNECT,
+    DOMAIN,
+    MODEL_A24,
+    MODEL_C20,
+    MODEL_UNKNOWN,
+    STORAGE_VERSION,
 )
 from .protocol import (
+    A24_CONTROL_SYNC_DONE,
+    APPLE_COMPANY_ID,
     UUIDS,
-    decode_text,
+    a24_battery_status,
+    a24_battery_volts,
+    clean_name,
+    encode_minutes_now,
+    firmware_from_bytes,
     gn_uuid,
+    parse_a24_advertisement,
     parse_c20_advertisement,
     parse_d30d,
-    parse_u16_le,
+    parse_goodnature_ibeacon,
     parse_u8,
+    parse_u16_le,
+    serial_from_bytes,
 )
 
 try:
@@ -56,9 +75,6 @@ except ImportError:  # pragma: no cover - local dev env may not include HA deps
 
 _LOGGER = logging.getLogger(__name__)
 U = UUIDS
-MODEL_UNKNOWN = "unknown"
-MODEL_A24 = "a24"
-MODEL_C20 = "c20"
 NORDIC_UART_SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
 NORDIC_UART_RX_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
 NORDIC_UART_TX_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
@@ -85,6 +101,29 @@ C20_BATTERY_STATE = ("STARTUP", "NOT_CONNECTED", "CRITICAL", "LOW", "NORMAL", "N
 C20_CHARGE_STATE = ("NOT_CHARGING", "CHARGING", "NO_DATA")
 C20_USB_STATE = ("DISCONNECTED", "CONNECTED", "NO_DATA")
 C20_STRIKER_SOURCE = ("TRIGGER", "UNUSED", "USER", "NO_DATA")
+
+# Fields of TrapState that are saved across restarts. An A24 can stay silent
+# for days, so without this every restart would blank its sensors.
+PERSISTED_FIELDS = (
+    "model_family",
+    "serial_number",
+    "firmware_version",
+    "kill_displayed",
+    "kill_read",
+    "last_strike_id",
+    "last_strike_at",
+    "strike_temperature_c",
+    "kill_alert",
+    "battery_volts",
+    "battery_internal_resistance",
+    "low_battery",
+    "new_error",
+    "unread_kills",
+    "adv_flags",
+    "last_seen",
+    "last_sync",
+)
+DATETIME_FIELDS = {"last_strike_at", "last_seen", "last_sync"}
 
 
 def _normalized_service_uuids(service_info: BluetoothServiceInfoBleak) -> set[str]:
@@ -122,30 +161,33 @@ class TrapState:
     model_family: str = MODEL_UNKNOWN
     model_source: str | None = None
 
-    # GATT-backed values
+    # Identity
     serial_number: str | None = None
     firmware_version: str | None = None
-    device_control: int | None = None
-    device_state_raw: int | None = None
-    device_config_raw: str | None = None
+
+    # A24 kill counters and latest record
     kill_displayed: int | None = None
     kill_read: int | None = None
-    kill_state_raw: int | None = None
-    event_displayed: int | None = None
-    event_read: int | None = None
-    event_data_raw: str | None = None
-    dead_raw: str | None = None
-    fade_raw: str | None = None
-    fad1_raw: int | None = None
-    fad2_raw: int | None = None
-    fad3_raw: int | None = None
-    e771_raw: str | None = None
-    e772_raw: str | None = None
-    e773_raw: str | None = None
     d30d_raw: str | None = None
     last_strike_id: int | None = None
     last_strike_at: datetime | None = None
-    last_strike_flags: int | None = None
+    strike_temperature_c: int | None = None
+    kill_alert: bool = False
+
+    # A24 advertisement status
+    adv_flags: int | None = None
+    unread_kills: int | None = None
+    battery_volts: float | None = None
+    battery_internal_resistance: int | None = None
+    low_battery: bool | None = None
+    new_error: bool | None = None
+
+    # A24 sync bookkeeping
+    last_sync: datetime | None = None
+    last_sync_attempt: datetime | None = None
+    sync_requested: bool = False
+
+    # C20
     c20_battery_percent: int | None = None
     c20_device_type: int | None = None
     c20_discoverable: bool | None = None
@@ -169,9 +211,13 @@ class TrapState:
     gatt_failures: int = 0
     last_gatt_error: str | None = None
 
+    @property
+    def battery_status(self) -> str | None:
+        return a24_battery_status(self.battery_internal_resistance)
+
 
 class GoodnatureCoordinator(DataUpdateCoordinator[None]):
-    """Track BLE advertisements and infer trap activations."""
+    """Track BLE advertisements and sync trap data."""
 
     config_entry: ConfigEntry
 
@@ -180,7 +226,7 @@ class GoodnatureCoordinator(DataUpdateCoordinator[None]):
         self.config_entry = config_entry
 
         self.address: str = config_entry.data[CONF_ADDRESS].upper()
-        self.name: str = config_entry.data.get(CONF_NAME, DEFAULT_NAME)
+        self.name: str = clean_name(config_entry.data.get(CONF_NAME)) or DEFAULT_NAME
 
         self.cooldown = timedelta(seconds=DEFAULT_COOLDOWN_SECONDS)
         self.active_window = timedelta(seconds=DEFAULT_ACTIVE_WINDOW_SECONDS)
@@ -189,12 +235,19 @@ class GoodnatureCoordinator(DataUpdateCoordinator[None]):
         self.enable_gatt: bool = DEFAULT_ENABLE_GATT
         self.gatt_min_poll = timedelta(seconds=DEFAULT_GATT_MIN_POLL_SECONDS)
         self.write_time_on_connect: bool = DEFAULT_WRITE_TIME_ON_CONNECT
-        self.send_control_zero: bool = DEFAULT_SEND_CONTROL_ZERO
+        self.a24_min_sync_interval = timedelta(seconds=A24_MIN_SYNC_INTERVAL_SECONDS)
+        self.a24_failed_sync_retry = timedelta(seconds=A24_FAILED_SYNC_RETRY_SECONDS)
+        self.a24_reconnect_guard = timedelta(seconds=A24_RECONNECT_GUARD_SECONDS)
+        self.a24_sync_window = timedelta(seconds=A24_SYNC_WINDOW_SECONDS)
 
         self.state = TrapState(address=self.address, name=self.name)
+        self._store: Store[dict[str, Any]] = Store(
+            hass, STORAGE_VERSION, f"{DOMAIN}.{self.address.replace(':', '').lower()}"
+        )
         self._unsubscribe_ble: CALLBACK_TYPE | None = None
         self._gatt_lock = asyncio.Lock()
         self._gatt_task: asyncio.Task | None = None
+        self._last_disconnect: datetime | None = None
 
         super().__init__(
             hass,
@@ -203,17 +256,55 @@ class GoodnatureCoordinator(DataUpdateCoordinator[None]):
             update_interval=COORDINATOR_UPDATE_INTERVAL,
         )
 
+    # ------------------------------------------------------------------
+    # Persistence
+
+    async def async_load(self) -> None:
+        """Restore saved trap state."""
+        data = await self._store.async_load()
+        if not data:
+            return
+        for field in PERSISTED_FIELDS:
+            if field not in data or data[field] is None:
+                continue
+            value = data[field]
+            if field in DATETIME_FIELDS:
+                value = dt_util.parse_datetime(value)
+            setattr(self.state, field, value)
+
+    @callback
+    def _async_save(self) -> None:
+        """Schedule a save of the persisted fields."""
+
+        def _data() -> dict[str, Any]:
+            out: dict[str, Any] = {}
+            for field in PERSISTED_FIELDS:
+                value = getattr(self.state, field)
+                if isinstance(value, datetime):
+                    value = value.isoformat()
+                out[field] = value
+            return out
+
+        self._store.async_delay_save(_data, 5)
+
+    # ------------------------------------------------------------------
+    # Advertisements
+
     async def _async_update_data(self) -> None:
         """No polling endpoint; BLE callbacks update state in near real-time."""
         if self._unsubscribe_ble is None:
+            # connectable=False: also accept packets from passive scanners and
+            # proxies. A sync still needs a connectable path, resolved later.
             self._unsubscribe_ble = async_register_callback(
                 self.hass,
                 self._async_handle_ble,
-                BluetoothCallbackMatcher(address=self.address),
+                BluetoothCallbackMatcher(address=self.address, connectable=False),
                 BluetoothScanningMode.ACTIVE,
             )
 
-        if self._should_poll_gatt(dt_util.utcnow()):
+        if self.state.model_family == MODEL_C20 and self._should_poll_gatt(
+            dt_util.utcnow()
+        ):
             self._schedule_gatt_refresh(reason="periodic")
 
     @callback
@@ -228,6 +319,8 @@ class GoodnatureCoordinator(DataUpdateCoordinator[None]):
         state = self.state
 
         self._update_model_from_advertisement(service_info)
+        if state.model_family != MODEL_C20:
+            self._update_from_a24_advertisement(service_info)
 
         state.last_seen = now
         state.last_rssi = service_info.rssi
@@ -252,10 +345,79 @@ class GoodnatureCoordinator(DataUpdateCoordinator[None]):
             state.last_activation = now
             state.estimated_activations += 1
             state.activation_counted_for_burst = True
+
+        if state.model_family == MODEL_C20:
             if self._should_poll_gatt(now):
                 self._schedule_gatt_refresh(reason="activation")
+        elif self._should_sync_a24(now):
+            self._schedule_a24_sync(reason="advertisement")
 
+        self._async_save()
         self.async_set_updated_data(None)
+
+    @callback
+    def _update_from_a24_advertisement(
+        self, service_info: BluetoothServiceInfoBleak
+    ) -> None:
+        """Decode A24 status from raw advertisement bytes and the iBeacon."""
+        state = self.state
+        raw = getattr(service_info, "raw", None)
+        adv = parse_a24_advertisement(raw)
+        if adv is not None:
+            self._set_model_family(MODEL_A24, source="a24_advertisement")
+            state.serial_number = adv.serial_number or state.serial_number
+            state.adv_flags = adv.flags
+            state.unread_kills = adv.unread_kills
+            state.low_battery = adv.low_battery
+            state.new_error = adv.new_error
+            if adv.battery_raw:
+                state.battery_volts = adv.battery_volts
+                state.battery_internal_resistance = adv.battery_internal_resistance
+            self._apply_kill_count(
+                self._expand_low8(adv.kill_count_low8), source="advertisement"
+            )
+            if adv.unread_kills and state.kill_displayed is not None:
+                # Unread kills on the trap: request a sync even inside the
+                # minimum interval.
+                state.sync_requested = True
+            return
+
+        apple = (service_info.manufacturer_data or {}).get(APPLE_COMPANY_ID)
+        serial = parse_goodnature_ibeacon(apple)
+        if serial is not None:
+            self._set_model_family(MODEL_A24, source="ibeacon")
+            state.serial_number = state.serial_number or serial
+
+    def _expand_low8(self, low8: int) -> int:
+        """Expand the advertised low 8 bits of the kill count using the known count."""
+        known = self.state.kill_displayed
+        if known is None:
+            return low8
+        candidate = (known & ~0xFF) | low8
+        if candidate < known:
+            candidate += 0x100
+        return candidate
+
+    @callback
+    def _apply_kill_count(self, count: int | None, *, source: str) -> None:
+        """Record a kill count; raise the kill alert when it goes up.
+
+        The first count ever seen is the baseline and does not raise the alert.
+        """
+        if count is None:
+            return
+        previous = self.state.kill_displayed
+        if previous is not None and count > previous:
+            self.state.kill_alert = True
+            self.logger.info(
+                "%s: kill count went from %s to %s (%s)",
+                self.name,
+                previous,
+                count,
+                source,
+            )
+        if previous is None or count >= previous:
+            self.state.kill_displayed = count
 
     def _update_model_from_advertisement(
         self, service_info: BluetoothServiceInfoBleak
@@ -334,8 +496,149 @@ class GoodnatureCoordinator(DataUpdateCoordinator[None]):
         self.state.model_family = family
         self.state.model_source = source
 
+    # ------------------------------------------------------------------
+    # A24 sync
+
+    def _should_sync_a24(self, now: datetime) -> bool:
+        """Decide whether to connect to an awake A24 now.
+
+        An A24 only accepts connections while it is awake, which is when it
+        advertises. Sync at most every A24_MIN_SYNC_INTERVAL_SECONDS unless
+        the trap reports unread kills or a sync was requested, retry a failed
+        sync after A24_FAILED_SYNC_RETRY_SECONDS, and never reconnect within
+        A24_RECONNECT_GUARD_SECONDS of the last disconnect (as the app does).
+        """
+        state = self.state
+        if not self.enable_gatt or BleakClient is None:
+            return False
+        if self._gatt_lock.locked() or (self._gatt_task and not self._gatt_task.done()):
+            return False
+        if self._last_disconnect and now - self._last_disconnect < self.a24_reconnect_guard:
+            return False
+        if state.last_sync_attempt and now - state.last_sync_attempt < self.a24_failed_sync_retry:
+            return False
+        if state.sync_requested or state.last_sync is None:
+            return True
+        return now - state.last_sync >= self.a24_min_sync_interval
+
+    @callback
+    def _schedule_a24_sync(self, reason: str) -> None:
+        if self._gatt_task and not self._gatt_task.done():
+            return
+        self._gatt_task = self.hass.async_create_task(self._async_sync_a24(reason))
+
+    async def _async_sync_a24(self, reason: str) -> bool:
+        """Sync an A24 the way the Goodnature app does, then acknowledge.
+
+        Order: read D20D, DE12, DE15, D60D, FAD1, FAD2; if there is a kill
+        record, select it (write D20D) and read it (D30D); mark it read (D60D);
+        write the time (F1AF); write 0x02 to DE13 ("sync done") last and
+        disconnect. The trap often hangs up right after 0x02, so a failure of
+        that final write is the normal end of a session. If anything before the
+        acknowledgement fails, F1AF and 0x02 are skipped, as in the app.
+        """
+        if BleakClient is None:
+            return False
+
+        state = self.state
+        async with self._gatt_lock:
+            state.last_sync_attempt = dt_util.utcnow()
+            ble_device = self._async_resolve_ble_device(connectable_only=True)
+            if ble_device is None:
+                state.last_gatt_error = "No connectable Bluetooth path to the trap"
+                self.async_set_updated_data(None)
+                return False
+
+            client: BleakClient | None = None
+            try:
+                client = await self._async_connect_client(ble_device)
+                ops = A24Session(client)
+                result = await ops.run(
+                    write_time=self.write_time_on_connect,
+                    now=dt_util.utcnow(),
+                )
+                self._apply_a24_session(result)
+                state.last_sync = dt_util.utcnow()
+                state.last_gatt_poll = state.last_sync
+                state.last_gatt_error = None
+                state.sync_requested = False
+                self.logger.debug(
+                    "A24 sync for %s (%s): %s", self.address, reason, result
+                )
+                return True
+            except Exception as err:  # noqa: BLE001
+                state.gatt_failures += 1
+                state.last_gatt_error = str(err) or type(err).__name__
+                self.logger.debug(
+                    "A24 sync failed for %s (%s): %s", self.address, reason, err
+                )
+                return False
+            finally:
+                if client is not None:
+                    try:
+                        await client.disconnect()
+                    except Exception:  # noqa: BLE001
+                        pass
+                self._last_disconnect = dt_util.utcnow()
+                self._async_save()
+                self.async_set_updated_data(None)
+
+    @callback
+    def _apply_a24_session(self, result: dict[str, Any]) -> None:
+        state = self.state
+        self._set_model_family(MODEL_A24, source="gatt_sync")
+        if result.get("serial"):
+            state.serial_number = result["serial"]
+        if result.get("firmware"):
+            state.firmware_version = result["firmware"]
+        if result.get("battery_raw"):
+            state.battery_volts = a24_battery_volts(result["battery_raw"])
+        if result.get("battery_ir") is not None:
+            state.battery_internal_resistance = result["battery_ir"]
+        record = result.get("record")
+        if record is not None:
+            state.d30d_raw = record.raw_hex
+            state.last_strike_id = record.record_number
+            state.last_strike_at = record.strike_at
+            state.strike_temperature_c = record.temperature_c
+            state.last_activation = record.strike_at or state.last_activation
+        self._apply_kill_count(result.get("kill_displayed"), source="gatt")
+        if result.get("kill_read") is not None:
+            state.kill_read = result["kill_read"]
+        if result.get("acknowledged"):
+            state.unread_kills = 0
+
+    async def async_manual_poll(self) -> bool:
+        """Sync now if the trap is awake, otherwise on its next wake-up."""
+        if self.state.model_family == MODEL_C20:
+            if BleakClient is None:
+                return False
+            await self._async_refresh_gatt("manual")
+            return self.state.last_gatt_error is None
+
+        self.state.sync_requested = True
+        now = dt_util.utcnow()
+        if self.state.last_seen and now - self.state.last_seen <= self.a24_sync_window:
+            self.state.last_sync_attempt = None
+            return await self._async_sync_a24("manual")
+        self.state.last_gatt_error = "Trap is asleep; it will sync when it next wakes"
+        self.async_set_updated_data(None)
+        return False
+
+    async def async_clear_kill_alert(self) -> bool:
+        """Clear the kill alert (A24: local latch; C20: trap CLEAR command)."""
+        if self.state.model_family == MODEL_C20:
+            return await self._async_c20_set_command(C20_COMMAND_CLEAR, action="clear")
+        self.state.kill_alert = False
+        self._async_save()
+        self.async_set_updated_data(None)
+        return True
+
+    # ------------------------------------------------------------------
+    # C20
+
     def _should_poll_gatt(self, now: datetime) -> bool:
-        """Return True when we should refresh GATT values."""
+        """Return True when we should refresh C20 GATT values."""
         if not self.enable_gatt or BleakClient is None:
             return False
 
@@ -363,7 +666,7 @@ class GoodnatureCoordinator(DataUpdateCoordinator[None]):
         self._gatt_task = self.hass.async_create_task(self._async_refresh_gatt(reason))
 
     async def _async_refresh_gatt(self, reason: str) -> None:
-        """Connect to the trap and read known characteristics."""
+        """Connect to a C20 and refresh it over the Nordic UART."""
         if BleakClient is None:
             return
 
@@ -378,24 +681,7 @@ class GoodnatureCoordinator(DataUpdateCoordinator[None]):
             client: BleakClient | None = None
             try:
                 client = await self._async_connect_client(ble_device)
-
-                if self.state.model_family == MODEL_C20:
-                    await self._async_refresh_c20_uart(client)
-                else:
-                    # A24 app behavior writes current time in minutes to F1AF.
-                    if self.write_time_on_connect:
-                        minutes = int(dt_util.utcnow().timestamp() // 60)
-                        await self._async_write_char(
-                            client,
-                            U["F1AF"],
-                            minutes.to_bytes(4, byteorder="little", signed=False),
-                        )
-
-                    if self.send_control_zero:
-                        await self._async_write_char(client, U["DE13"], b"\x00")
-
-                    await self._async_read_known_chars(client)
-
+                await self._async_refresh_c20_uart(client)
                 self.state.last_gatt_poll = dt_util.utcnow()
                 self.state.last_gatt_error = None
                 self.logger.debug("GATT refresh successful for %s (%s)", self.address, reason)
@@ -421,102 +707,13 @@ class GoodnatureCoordinator(DataUpdateCoordinator[None]):
                         )
                 self.async_set_updated_data(None)
 
-    async def async_manual_poll(self) -> bool:
-        """Manually poll GATT once."""
-        if BleakClient is None:
-            return False
-        await self._async_refresh_gatt("manual")
-        return self.state.last_gatt_error is None
-
-    async def async_acknowledge_kills(self) -> bool:
-        """Set kill read pointer to the current displayed count."""
-        return await self._async_acknowledge_alerts(ack_kills=True, ack_events=False)
-
-    async def async_acknowledge_events(self) -> bool:
-        """Set event read pointer to the current displayed count."""
-        return await self._async_acknowledge_alerts(ack_kills=False, ack_events=True)
-
-    async def async_reset_alert(self) -> bool:
-        """Acknowledge both kill and event alerts using the known write flow."""
-        return await self._async_acknowledge_alerts(ack_kills=True, ack_events=True)
-
     async def async_test_fire(self) -> bool:
-        """Trigger trap test fire using known command paths."""
-        if BleakClient is None:
-            return False
-
-        if self.state.model_family not in (MODEL_A24, MODEL_C20):
-            self.state.last_gatt_error = "Trap model is not known yet"
-            self.async_set_updated_data(None)
-            return False
-
-        if self.state.model_family == MODEL_A24:
-            return await self._async_a24_test_fire()
-
-        return await self._async_c20_set_command(C20_COMMAND_FIRE, action="test_fire")
-
-    async def async_clear_kill(self) -> bool:
-        """Clear the C20 kill alert using the app's CLEAR command."""
+        """Test fire a C20 (A24 has no BLE test fire)."""
         if self.state.model_family != MODEL_C20:
-            self.state.last_gatt_error = "Clear is only supported for C20"
+            self.state.last_gatt_error = "Test fire is only supported on the C20"
             self.async_set_updated_data(None)
             return False
-        return await self._async_c20_set_command(C20_COMMAND_CLEAR, action="clear")
-
-    async def _async_a24_test_fire(self) -> bool:
-        """Test-fire an A24 using the flow implemented by the mobile app."""
-        async with self._gatt_lock:
-            ble_device = self._async_resolve_ble_device()
-            if ble_device is None:
-                self.state.gatt_failures += 1
-                self.state.last_gatt_error = "BLE device not available"
-                self.async_set_updated_data(None)
-                return False
-
-            client: BleakClient | None = None
-            try:
-                client = await self._async_connect_client(ble_device)
-                if not await self._async_write_char(client, U["DE13"], b"\x05"):
-                    raise RuntimeError("A24 test fire control write failed")
-
-                # The app waits for Kill Displayed, writes that selector back to
-                # D20D, then reads D30D for the generated test strike.
-                await asyncio.sleep(0.5)
-                kill_displayed_raw = await self._async_read_char(client, U["D20D"])
-                if kill_displayed_raw is None:
-                    raise RuntimeError("A24 test fire did not return Kill Displayed")
-                if not await self._async_write_char(
-                    client, U["D20D"], kill_displayed_raw[:2]
-                ):
-                    raise RuntimeError("A24 test strike selection failed")
-                self.state.kill_displayed = parse_u16_le(kill_displayed_raw)
-
-                d30d = await self._async_read_char(client, U["D30D"])
-                d30d_raw, strike_id, strike_at, strike_flags = parse_d30d(d30d)
-                if strike_id is None or strike_at is None:
-                    raise RuntimeError("A24 test fire did not return a strike record")
-                self.state.d30d_raw = d30d_raw
-                self.state.last_strike_id = strike_id
-                self.state.last_strike_at = strike_at
-                self.state.last_strike_flags = strike_flags
-                self.state.last_activation = strike_at or dt_util.utcnow()
-                self.state.last_gatt_poll = dt_util.utcnow()
-                self.state.last_gatt_error = None
-                self.async_set_updated_data(None)
-                return True
-            except Exception as err:  # noqa: BLE001
-                self.state.gatt_failures += 1
-                self.state.last_gatt_error = str(err)
-                self.async_set_updated_data(None)
-                return False
-            finally:
-                if client and client.is_connected:
-                    try:
-                        await client.disconnect()
-                    except Exception as err:  # noqa: BLE001
-                        self.logger.debug(
-                            "Disconnect failed for A24 test fire: %s", err
-                        )
+        return await self._async_c20_set_command(C20_COMMAND_FIRE, action="test_fire")
 
     async def _async_c20_set_command(self, command: int, *, action: str) -> bool:
         """Send a C20 SetCommandRequest using the app protocol."""
@@ -602,153 +799,6 @@ class GoodnatureCoordinator(DataUpdateCoordinator[None]):
                             err,
                         )
 
-    async def _async_acknowledge_alerts(
-        self,
-        *,
-        ack_kills: bool,
-        ack_events: bool,
-    ) -> bool:
-        """Acknowledge alert channels and write control 0x02."""
-        if BleakClient is None:
-            return False
-
-        async with self._gatt_lock:
-            ble_device = self._async_resolve_ble_device()
-            if ble_device is None:
-                self.state.gatt_failures += 1
-                self.state.last_gatt_error = "BLE device not available"
-                self.async_set_updated_data(None)
-                return False
-
-            client: BleakClient | None = None
-            try:
-                client = await self._async_connect_client(ble_device)
-
-                kill_displayed = parse_u16_le(await self._async_read_char(client, U["D20D"]))
-                event_displayed = parse_u16_le(await self._async_read_char(client, U["D2ED"]))
-
-                if ack_kills and kill_displayed is not None:
-                    await self._async_write_char(
-                        client,
-                        U["D60D"],
-                        kill_displayed.to_bytes(2, byteorder="little", signed=False),
-                    )
-                    self.state.kill_read = kill_displayed
-
-                if ack_events and event_displayed is not None:
-                    await self._async_write_char(
-                        client,
-                        U["D3ED"],
-                        event_displayed.to_bytes(2, byteorder="little", signed=False),
-                    )
-                    self.state.event_read = event_displayed
-
-                await self._async_write_char(client, U["DE13"], b"\x02")
-                await self._async_read_known_chars(client)
-
-                self.state.last_gatt_poll = dt_util.utcnow()
-                self.state.last_gatt_error = None
-                self.async_set_updated_data(None)
-                return True
-            except Exception as err:  # noqa: BLE001
-                self.state.gatt_failures += 1
-                self.state.last_gatt_error = str(err)
-                self.async_set_updated_data(None)
-                return False
-            finally:
-                if client and client.is_connected:
-                    try:
-                        await client.disconnect()
-                    except Exception as err:  # noqa: BLE001
-                        self.logger.debug(
-                            "Disconnect failed for %s (acknowledge): %s",
-                            self.address,
-                            err,
-                        )
-
-    async def _async_connect_client(self, ble_device):
-        """Establish a BLE connection using HA-recommended retry connector."""
-        if BleakClient is None:
-            raise RuntimeError("bleak is not available")
-
-        if establish_connection is not None:
-            return await establish_connection(
-                BleakClient,
-                ble_device,
-                self.name,
-                max_attempts=3,
-            )
-
-        client = BleakClient(ble_device, timeout=10.0)
-        await client.connect()
-        return client
-
-    async def _async_read_known_chars(self, client: BleakClient) -> None:
-        """Read and parse known characteristics."""
-        de12 = await self._async_read_char(client, U["DE12"])
-        de13 = await self._async_read_char(client, U["DE13"])
-        de14 = await self._async_read_char(client, U["DE14"])
-        de15 = await self._async_read_char(client, U["DE15"])
-        de16 = await self._async_read_char(client, U["DE16"])
-        de18 = await self._async_read_char(client, U["DE18"])
-
-        d20d = await self._async_read_char(client, U["D20D"])
-        d30d = await self._async_read_char(client, U["D30D"])
-        d50d = await self._async_read_char(client, U["D50D"])
-        d60d = await self._async_read_char(client, U["D60D"])
-
-        d2ed = await self._async_read_char(client, U["D2ED"])
-        deed = await self._async_read_char(client, U["DEED"])
-        d3ed = await self._async_read_char(client, U["D3ED"])
-
-        fad1 = await self._async_read_char(client, U["FAD1"])
-        fad2 = await self._async_read_char(client, U["FAD2"])
-        fad3 = await self._async_read_char(client, U["FAD3"])
-        fade = await self._async_read_char(client, U["FADE"])
-
-        e771 = await self._async_read_char(client, U["E771"])
-        e772 = await self._async_read_char(client, U["E772"])
-        e773 = await self._async_read_char(client, U["E773"])
-
-        self.state.serial_number = decode_text(de12)
-        self.state.device_control = parse_u8(de13)
-        self.state.device_state_raw = parse_u16_le(de14)
-        self.state.firmware_version = decode_text(de15)
-        self.state.device_config_raw = de16.hex() if de16 else None
-        self.state.dead_raw = de18.hex() if de18 else None
-
-        self.state.kill_displayed = parse_u16_le(d20d)
-        self.state.kill_state_raw = parse_u16_le(d50d)
-        self.state.kill_read = parse_u16_le(d60d)
-
-        self.state.event_displayed = parse_u16_le(d2ed)
-        self.state.event_data_raw = deed.hex() if deed else None
-        self.state.event_read = parse_u16_le(d3ed)
-
-        self.state.fad1_raw = parse_u16_le(fad1)
-        self.state.fad2_raw = parse_u16_le(fad2)
-        self.state.fad3_raw = parse_u16_le(fad3)
-        self.state.fade_raw = fade.hex() if fade else None
-
-        self.state.e771_raw = e771.hex() if e771 else None
-        self.state.e772_raw = e772.hex() if e772 else None
-        self.state.e773_raw = e773.hex() if e773 else None
-
-        d30d_raw, strike_id, strike_at, strike_flags = parse_d30d(d30d)
-        self.state.d30d_raw = d30d_raw
-        self.state.last_strike_id = strike_id
-        self.state.last_strike_at = strike_at
-        self.state.last_strike_flags = strike_flags
-
-        if d20d is not None or d30d is not None or d60d is not None:
-            self._set_model_family(MODEL_A24, source="gatt_poll")
-
-    async def _async_read_char(self, client: BleakClient, uuid: str) -> bytes | None:
-        """Read a characteristic safely."""
-        try:
-            return await client.read_gatt_char(uuid)
-        except Exception:  # noqa: BLE001
-            return None
 
     def _decode_c20_frame(self, frame: bytes) -> tuple[int, int, bytes] | None:
         """Decode a single C20 UART frame into (message_type, subtype, payload)."""
@@ -1023,14 +1073,38 @@ class GoodnatureCoordinator(DataUpdateCoordinator[None]):
                 work = (work << 1) & 0xFFFF
         return crc & 0xFFFF
 
-    def _async_resolve_ble_device(self):
+    async def _async_connect_client(self, ble_device):
+        """Establish a BLE connection using HA-recommended retry connector."""
+        if BleakClient is None:
+            raise RuntimeError("bleak is not available")
+
+        if establish_connection is not None:
+            return await establish_connection(
+                BleakClient,
+                ble_device,
+                self.name,
+                max_attempts=2,
+            )
+
+        client = BleakClient(ble_device, timeout=10.0)
+        await client.connect()
+        return client
+
+    async def _async_read_char(self, client: BleakClient, uuid: str) -> bytes | None:
+        """Read a characteristic safely."""
+        try:
+            return await client.read_gatt_char(uuid)
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _async_resolve_ble_device(self, connectable_only: bool = False):
         """Resolve current BLE device record by address."""
         ble_device = async_ble_device_from_address(
             self.hass,
             self.address,
             connectable=True,
         )
-        if ble_device is not None:
+        if ble_device is not None or connectable_only:
             return ble_device
 
         return async_ble_device_from_address(
@@ -1044,16 +1118,16 @@ class GoodnatureCoordinator(DataUpdateCoordinator[None]):
         """Try to resolve the live BLE device name."""
         device = async_ble_device_from_address(self.hass, self.address, connectable=True)
         if device and device.name:
-            return device.name
+            return clean_name(device.name)
         return None
 
     @property
     def model_name(self) -> str:
         """User-facing model label."""
         if self.state.model_family == MODEL_C20:
-            return "C20"
+            return "C20 Mouse Trap"
         if self.state.model_family == MODEL_A24:
-            return "A24 Chirp"
+            return "A24"
         return "Unknown"
 
     def async_shutdown(self) -> None:
@@ -1065,3 +1139,69 @@ class GoodnatureCoordinator(DataUpdateCoordinator[None]):
         if self._gatt_task and not self._gatt_task.done():
             self._gatt_task.cancel()
             self._gatt_task = None
+
+
+class A24Session:
+    """One A24 GATT session in the Goodnature app's order.
+
+    Kept separate from the coordinator so it can be tested with a fake client.
+    """
+
+    def __init__(self, client: Any) -> None:
+        self._client = client
+        self.log: list[tuple[str, str, bytes | None]] = []
+
+    async def _read(self, short_id: str) -> bytes | None:
+        try:
+            value = await self._client.read_gatt_char(U[short_id])
+        except Exception:  # noqa: BLE001
+            value = None
+        self.log.append(("read", short_id, None if value is None else bytes(value)))
+        return None if value is None else bytes(value)
+
+    async def _write(self, short_id: str, value: bytes) -> None:
+        self.log.append(("write", short_id, value))
+        await self._client.write_gatt_char(U[short_id], value, response=True)
+
+    async def run(self, *, write_time: bool, now: datetime) -> dict[str, Any]:
+        """Run the session and return what was read.
+
+        Raises if the kill count cannot be read or a kill record cannot be
+        fetched; in that case nothing has been acknowledged.
+        """
+        result: dict[str, Any] = {"acknowledged": False}
+
+        d20d = await self._read("D20D")
+        kill_displayed = parse_u16_le(d20d)
+        if kill_displayed is None:
+            raise RuntimeError("Could not read the kill count (D20D)")
+        result["kill_displayed"] = kill_displayed
+
+        result["serial"] = serial_from_bytes(await self._read("DE12"))
+        result["firmware"] = firmware_from_bytes(await self._read("DE15"))
+        result["kill_read"] = parse_u16_le(await self._read("D60D"))
+        result["battery_raw"] = parse_u8(await self._read("FAD1"))
+        result["battery_ir"] = parse_u8(await self._read("FAD2"))
+
+        if kill_displayed > 0:
+            selector = kill_displayed.to_bytes(2, "little")
+            await self._write("D20D", selector)
+            record = parse_d30d(await self._read("D30D"))
+            if record is None:
+                raise RuntimeError("Could not read the newest kill record (D30D)")
+            result["record"] = record
+            if result["kill_read"] != kill_displayed:
+                await self._write("D60D", selector)
+                result["kill_read"] = kill_displayed
+
+        if write_time:
+            await self._write("F1AF", encode_minutes_now(now))
+
+        # "Sync done". The trap often hangs up before confirming this write,
+        # which is the normal end of a session, not a failure.
+        try:
+            await self._write("DE13", bytes([A24_CONTROL_SYNC_DONE]))
+        except Exception:  # noqa: BLE001
+            pass
+        result["acknowledged"] = True
+        return result

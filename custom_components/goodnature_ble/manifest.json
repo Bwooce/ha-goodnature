@@ -33,14 +33,30 @@
     {
       "service_uuid": "00001234-0000-1000-8000-00805f9b34fb",
       "connectable": true
+    },
+    {
+      "manufacturer_id": 76,
+      "manufacturer_data_start": [
+        2,
+        21,
+        176,
+        176,
+        238,
+        231
+      ],
+      "connectable": false
     }
   ],
-  "codeowners": ["@codyc1515"],
+  "codeowners": [
+    "@Bwooce"
+  ],
   "config_flow": true,
-  "dependencies": ["bluetooth"],
-  "documentation": "https://github.com/codyc1515/ha-goodnature",
+  "dependencies": [
+    "bluetooth"
+  ],
+  "documentation": "https://github.com/Bwooce/ha-goodnature",
   "integration_type": "device",
   "iot_class": "local_push",
-  "issue_tracker": "https://github.com/codyc1515/ha-goodnature/issues",
-  "version": "0.2.0"
+  "issue_tracker": "https://github.com/Bwooce/ha-goodnature/issues",
+  "version": "0.3.0"
 }

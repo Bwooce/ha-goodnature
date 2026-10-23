@@ -15,7 +15,12 @@ from .const import (
     DEFAULT_NAME,
     DOMAIN,
 )
-from .protocol import GOODNATURE_DISCOVERY_UUIDS
+from .protocol import (
+    APPLE_COMPANY_ID,
+    GOODNATURE_DISCOVERY_UUIDS,
+    clean_name,
+    parse_goodnature_ibeacon,
+)
 
 
 def _normalized_service_uuids(service_info: BluetoothServiceInfoBleak) -> set[str]:
@@ -38,8 +43,14 @@ def _normalized_service_uuids(service_info: BluetoothServiceInfoBleak) -> set[st
 
 def _is_goodnature(service_info: BluetoothServiceInfoBleak) -> bool:
     """Return True if this advertisement looks like a Goodnature trap."""
-    local_name = (service_info.name or service_info.device.name or "").strip().lower()
+    local_name = (clean_name(service_info.name or service_info.device.name) or "").lower()
     if local_name == "gn":
+        return True
+
+    # An A24 Chirp's main advertisement is an iBeacon carrying its serial.
+    if parse_goodnature_ibeacon(
+        (service_info.manufacturer_data or {}).get(APPLE_COMPANY_ID)
+    ):
         return True
 
     uuids = _normalized_service_uuids(service_info)
@@ -105,15 +116,15 @@ class GoodnatureConfigFlow(ConfigFlow, domain=DOMAIN):
 
         address = discovery_info.address.upper()
         await self.async_set_unique_id(address)
-        updates: dict[str, Any] | None = None
-        if discovery_info.name:
-            updates = {CONF_NAME: discovery_info.name}
-        self._abort_if_unique_id_configured(updates=updates)
+        # Keep the user's chosen name: do not push the advertised name ("GN")
+        # into an existing entry.
+        self._abort_if_unique_id_configured()
 
+        advertised = clean_name(discovery_info.name)
         self.context["title_placeholders"] = {
-            "name": discovery_info.name or discovery_info.address
+            "name": advertised or discovery_info.address
         }
-        self._discovered_name = discovery_info.name or DEFAULT_NAME
+        self._discovered_name = DEFAULT_NAME if advertised in (None, "GN") else advertised
 
         return await self.async_step_bluetooth_confirm()
 

@@ -1,6 +1,6 @@
 # Goodnature BLE (Home Assistant Custom Integration)
 
-[![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=codyc1515&repository=ha-goodnature&category=integration)
+[![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=Bwooce&repository=ha-goodnature&category=integration)
 
 This integration supports Goodnature BLE traps (A24 Chirp and C20) via:
 
@@ -8,6 +8,42 @@ This integration supports Goodnature BLE traps (A24 Chirp and C20) via:
 - optional active GATT polling/writes.
 
 The goal is to use trap-reported counters when available and only infer from BLE bursts when needed.
+
+## This fork
+
+Fork of [codyc1515/ha-goodnature](https://github.com/codyc1515/ha-goodnature) with the A24
+reworked using the protocol notes published in
+[kedube/ha-goodnature-gateway](https://github.com/kedube/ha-goodnature-gateway/blob/main/docs/ble-protocol.md)
+(derived from the Goodnature Android app and real traps). That project is an ESPHome gateway
+under GPL-3.0; no code was copied from it, only protocol facts. The C20 code is unchanged from upstream.
+
+A24 changes in 0.3.0:
+
+- **Works through passive Bluetooth proxies.** The advertisement listener no longer requires
+  connectable packets, so traps heard only by a passive ESPHome proxy are tracked.
+- **Decodes the A24 advertisement** (from the raw bytes): serial, kill count, unread kills, battery
+  voltage and internal resistance, low-battery and error flags. An A24 Chirp's main advertisement
+  is an iBeacon whose major/minor carry the serial; that is also recognised.
+- **Syncs like the app, then acknowledges.** When the trap wakes, it connects, reads the kill count,
+  firmware and battery, reads the newest kill record (time and air temperature), marks it read,
+  sets the trap's clock and writes the "sync done" control value. Without that last write the trap
+  keeps its new-event flag set and keeps waking to report, which costs battery. Side effect: the
+  Goodnature app still downloads kills but no longer shows its own new-strike notification.
+- **Kill Alert** turns on when the kill count goes up (the first count seen is the baseline) and
+  stays on until **Clear Kill Alert**.
+- **State is saved** across Home Assistant restarts, since an A24 can be silent for days.
+- **Removed for the A24:** Test Fire (the BLE command does not fire an A24) and Reset Alert
+  (acknowledgement is now automatic). The A24 has no battery percentage or CO2 count over BLE.
+- Fixed the device name being overwritten with the advertised `GN\0\0`.
+
+A24 entities: Strikes, Kill Alert, Last Strike, Last Strike Temperature, Battery Voltage,
+Battery Status, Battery Low, Unread Kills, Trap Error Flag, Last Seen, Last Sync, Signal Strength,
+Poll Now, Clear Kill Alert. **Poll Now** syncs immediately if the trap is awake, otherwise at its
+next wake-up; an A24 cannot be woken over Bluetooth.
+
+Where the upstream notes below disagree with this section for the A24, this section is current.
+
+Tests: `pip install -r requirements_test.txt && pytest`.
 
 ## Current status
 
