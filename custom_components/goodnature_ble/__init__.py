@@ -35,6 +35,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     coordinator = GoodnatureCoordinator(hass, entry)
     await coordinator.async_load()
+    coordinator.model_at_setup = coordinator.state.model_family
     await coordinator.async_config_entry_first_refresh()
 
     entry.runtime_data = GoodnatureRuntimeData(

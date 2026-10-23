@@ -248,12 +248,16 @@ class GoodnatureCoordinator(DataUpdateCoordinator[None]):
         self._gatt_lock = asyncio.Lock()
         self._gatt_task: asyncio.Task | None = None
         self._last_disconnect: datetime | None = None
+        self._reload_scheduled = False
+        self.model_at_setup: str = MODEL_UNKNOWN
+        self.a24_quiet_before_reload = timedelta(seconds=90)
 
         super().__init__(
             hass,
             logger=_LOGGER,
             name=self.name,
             update_interval=COORDINATOR_UPDATE_INTERVAL,
+            config_entry=config_entry,
         )
 
     # ------------------------------------------------------------------
@@ -272,20 +276,19 @@ class GoodnatureCoordinator(DataUpdateCoordinator[None]):
                 value = dt_util.parse_datetime(value)
             setattr(self.state, field, value)
 
+    def _store_data(self) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        for field in PERSISTED_FIELDS:
+            value = getattr(self.state, field)
+            if isinstance(value, datetime):
+                value = value.isoformat()
+            out[field] = value
+        return out
+
     @callback
     def _async_save(self) -> None:
         """Schedule a save of the persisted fields."""
-
-        def _data() -> dict[str, Any]:
-            out: dict[str, Any] = {}
-            for field in PERSISTED_FIELDS:
-                value = getattr(self.state, field)
-                if isinstance(value, datetime):
-                    value = value.isoformat()
-                out[field] = value
-            return out
-
-        self._store.async_delay_save(_data, 5)
+        self._store.async_delay_save(self._store_data, 5)
 
     # ------------------------------------------------------------------
     # Advertisements
@@ -302,10 +305,26 @@ class GoodnatureCoordinator(DataUpdateCoordinator[None]):
                 BluetoothScanningMode.ACTIVE,
             )
 
-        if self.state.model_family == MODEL_C20 and self._should_poll_gatt(
-            dt_util.utcnow()
-        ):
+        now = dt_util.utcnow()
+        if self.state.model_family == MODEL_C20 and self._should_poll_gatt(now):
             self._schedule_gatt_refresh(reason="periodic")
+
+        # Entities are chosen by model at setup. When the model was unknown
+        # then and has since been identified, reload once to drop the other
+        # model's entities, after the trap has gone quiet so a sync is not cut off.
+        if (
+            self.model_at_setup == MODEL_UNKNOWN
+            and self.state.model_family != MODEL_UNKNOWN
+            and not self._reload_scheduled
+            and not (self._gatt_task and not self._gatt_task.done())
+            and (
+                self.state.last_packet is None
+                or now - self.state.last_packet > self.a24_quiet_before_reload
+            )
+        ):
+            self._reload_scheduled = True
+            await self._store.async_save(self._store_data())
+            self.hass.config_entries.async_schedule_reload(self.config_entry.entry_id)
 
     @callback
     def _async_handle_ble(

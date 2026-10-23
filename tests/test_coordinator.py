@@ -171,3 +171,32 @@ async def test_setup_cleans_name_and_drops_stale_entities(
     assert strikes.state == "26"
 
     assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_reloads_once_after_model_identified_and_trap_quiet(hass: HomeAssistant) -> None:
+    coordinator = make_coordinator(hass)
+    coordinator.model_at_setup = "unknown"
+    coordinator._async_handle_ble(service_info(ADV + scan_rsp(26)), BluetoothChange.ADVERTISEMENT)
+    assert coordinator.state.model_family == MODEL_A24
+
+    with patch.object(hass.config_entries, "async_schedule_reload") as reload:
+        await coordinator._async_update_data()  # trap still awake: wait
+        reload.assert_not_called()
+
+        coordinator.state.last_packet = dt_util.utcnow() - timedelta(seconds=91)
+        await coordinator._async_update_data()
+        reload.assert_called_once_with(coordinator.config_entry.entry_id)
+
+        await coordinator._async_update_data()
+        reload.assert_called_once()  # only once
+    coordinator.async_shutdown()
+
+
+async def test_no_reload_when_model_known_at_setup(hass: HomeAssistant) -> None:
+    coordinator = make_coordinator(hass)
+    coordinator.state.model_family = MODEL_A24
+    coordinator.model_at_setup = MODEL_A24
+    with patch.object(hass.config_entries, "async_schedule_reload") as reload:
+        await coordinator._async_update_data()
+        reload.assert_not_called()
+    coordinator.async_shutdown()
