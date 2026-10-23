@@ -352,7 +352,9 @@ class C20Advertisement:
     usb_connected: bool
     discoverable: bool
     strike_count: int
-    battery_percent: int
+    # Battery state enumeration (4 = NORMAL), not a percentage (kedube notes,
+    # observed on Mouse Trap firmware 0.3.730).
+    battery_state_raw: int
 
 
 def parse_c20_advertisement(value: bytes | None) -> C20Advertisement | None:
@@ -371,5 +373,5 @@ def parse_c20_advertisement(value: bytes | None) -> C20Advertisement | None:
         usb_connected=bool(flags & 0x20),
         discoverable=bool(flags & 0x40),
         strike_count=int.from_bytes(value[6:8], "little"),
-        battery_percent=value[8],
+        battery_state_raw=value[8],
     )

@@ -17,7 +17,8 @@ DEFAULT_ACTIVE_WINDOW_SECONDS = 120
 DEFAULT_MIN_PACKETS_FOR_ACTIVATION = 3
 DEFAULT_BURST_GAP_SECONDS = 8
 DEFAULT_ENABLE_GATT = True
-DEFAULT_GATT_MIN_POLL_SECONDS = 120
+# Mouse Trap poll interval (it advertises continuously); the app checks every 15 min.
+DEFAULT_GATT_MIN_POLL_SECONDS = 15 * 60
 DEFAULT_WRITE_TIME_ON_CONNECT = True
 
 # A24 sync policy. The trap only accepts a connection while it is awake.

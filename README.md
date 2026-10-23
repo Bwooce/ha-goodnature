@@ -59,7 +59,25 @@ trap is still identified (iBeacon) and synced, but advert-only values (unread ki
 available between syncs. Home Assistant does not keep the order of the 16-bit UUID list, so the
 slots cannot be rebuilt from it safely.
 
-Where the upstream notes below disagree with this section for the A24, this section is current.
+Mouse Trap ("C20") changes, **untested on a real Mouse Trap** (none available), following the
+kedube notes and gateway, which were developed against two Mouse Traps on firmware 0.3.730:
+
+- Polls every 15 minutes (it was every 2 minutes for as long as the trap advertises, which is
+  always), with the same failure backoff as the A24.
+- **Test Fire is refused** unless the trap's state was read in the last 20 minutes and it is not
+  in error, not on the charger, has no kill waiting and has its tray closed (the app's conditions).
+- Strikes come only from the advertisement's lifetime counter; the device-state and striker-event
+  counts are not lifetime totals and no longer overwrite it.
+- The advertisement's last byte is the battery *state* (4 = normal), not a percentage; the
+  percentage comes from the poll. The armed state is not taken from the advertisement (armed traps
+  send 0x04, not the documented 0x01).
+- Only sensor-triggered strikes count as kills (not test fires or motor self-tests).
+- Every session starts with the app's WAKE command.
+
+Known gaps: the app's kill-history request (0x14) is not used (kills are counted from the
+advertisement), and a Mouse Trap whose Bluetooth address changes would need re-adding.
+
+Where the upstream notes below disagree with this section, this section is current.
 
 Tests: `pip install -r requirements_test.txt && pytest`.
 

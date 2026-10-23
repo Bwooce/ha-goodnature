@@ -18,6 +18,7 @@ from homeassistant.components.bluetooth import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
@@ -83,6 +84,8 @@ MEMFAULT_DIAG_SERVICE_UUID = "54220000-f6a5-4007-a371-722f4ebd8436"
 MFG_GOODNATURE = 0x0059
 C20_COMMAND_FIRE = 1049702590
 C20_COMMAND_CLEAR = 1682499629
+# Sent first in every session by app 3.6.1; acknowledged with an echo.
+C20_COMMAND_WAKE = 1384542436
 C20_TYPE_SET_TIME = 0x04
 C20_TYPE_FIRMWARE = 0x08
 C20_TYPE_DEVICE_STATE = 0x10
@@ -101,7 +104,11 @@ C20_TRAY_STATE = ("OPEN", "CLOSED", "UNKNOWN", "NO_DATA")
 C20_BATTERY_STATE = ("STARTUP", "NOT_CONNECTED", "CRITICAL", "LOW", "NORMAL", "NO_DATA")
 C20_CHARGE_STATE = ("NOT_CHARGING", "CHARGING", "NO_DATA")
 C20_USB_STATE = ("DISCONNECTED", "CONNECTED", "NO_DATA")
-C20_STRIKER_SOURCE = ("TRIGGER", "UNUSED", "USER", "NO_DATA")
+# App 3.6.1 names: SENSOR, UNUSED, APP (test fire), BACKDRIVE_TEST, UNKNOWN.
+C20_STRIKER_SOURCE = ("TRIGGER", "UNUSED", "USER", "BACKDRIVE_TEST", "NO_DATA")
+
+# A test fire needs a recent read of the Mouse Trap's state.
+C20_TEST_FIRE_STATE_MAX_AGE = timedelta(minutes=20)
 
 # Kill records stamped before this (2017-07-14) mean the trap's clock was not set.
 MIN_PLAUSIBLE_EPOCH = 1_500_000_000
@@ -526,14 +533,16 @@ class GoodnatureCoordinator(DataUpdateCoordinator[None]):
         if c20_advertisement is not None:
             self.state.serial_number = c20_advertisement.serial_number
             self.state.c20_device_type = c20_advertisement.device_type
-            self.state.c20_device_state = (
-                "ACTIVATED" if c20_advertisement.activated else "DEACTIVATED"
-            )
+            # Not derived from the advert: armed Mouse Traps were observed
+            # sending 0x04, never the documented 0x01 (kedube notes), so the
+            # device state only comes from the UART poll.
             self.state.c20_kill_state = (
                 "DETECTED" if c20_advertisement.strikes_available else "CLEARED"
             )
-            self.state.c20_battery_state = (
-                "LOW" if c20_advertisement.low_battery else "NORMAL"
+            # Byte 8 is the battery state enumeration (4 = NORMAL), not a
+            # percentage; the percentage only comes from the UART poll.
+            self.state.c20_battery_state = self._enum_at(
+                C20_BATTERY_STATE, c20_advertisement.battery_state_raw
             )
             self.state.c20_charge_state = (
                 "CHARGING" if c20_advertisement.charging else "NOT_CHARGING"
@@ -542,8 +551,8 @@ class GoodnatureCoordinator(DataUpdateCoordinator[None]):
                 "CONNECTED" if c20_advertisement.usb_connected else "DISCONNECTED"
             )
             self.state.c20_discoverable = c20_advertisement.discoverable
+            # The advert's count matches the app's lifetime total.
             self.state.c20_strike_count = c20_advertisement.strike_count
-            self.state.c20_battery_percent = c20_advertisement.battery_percent
 
         if (
             mfg_payload
@@ -771,10 +780,19 @@ class GoodnatureCoordinator(DataUpdateCoordinator[None]):
         if now - self.state.last_seen > self.active_window:
             return False
 
-        if self.state.last_gatt_poll is None:
+        state = self.state
+        if state.last_sync_attempt and state.consecutive_sync_failures:
+            backoff = min(
+                self.a24_failed_sync_retry * 2 ** (state.consecutive_sync_failures - 1),
+                self.a24_max_sync_backoff,
+            )
+            if now - state.last_sync_attempt < backoff:
+                return False
+
+        if state.last_gatt_poll is None:
             return True
 
-        return now - self.state.last_gatt_poll >= self.gatt_min_poll
+        return now - state.last_gatt_poll >= self.gatt_min_poll
 
     @callback
     def _schedule_gatt_refresh(self, reason: str) -> None:
@@ -798,14 +816,17 @@ class GoodnatureCoordinator(DataUpdateCoordinator[None]):
                 return
 
             client: BleakClient | None = None
+            self.state.last_sync_attempt = dt_util.utcnow()
             try:
                 client = await self._async_connect_client(ble_device)
                 await self._async_refresh_c20_uart(client)
                 self.state.last_gatt_poll = dt_util.utcnow()
                 self.state.last_gatt_error = None
+                self.state.consecutive_sync_failures = 0
                 self.logger.debug("GATT refresh successful for %s (%s)", self.address, reason)
             except Exception as err:  # noqa: BLE001
                 self.state.gatt_failures += 1
+                self.state.consecutive_sync_failures += 1
                 self.state.last_gatt_error = str(err)
                 self.logger.debug(
                     "GATT refresh failed for %s (%s): %s",
@@ -826,12 +847,36 @@ class GoodnatureCoordinator(DataUpdateCoordinator[None]):
                         )
                 self.async_set_updated_data(None)
 
+    def test_fire_blocked(self) -> str | None:
+        """Why a test fire is not allowed now, or None.
+
+        The app only offers a test fire on a Mouse Trap that is off USB, has no
+        kill waiting, has its tray closed and is not in error; it also needs the
+        trap's state to have been read. The A24 cannot be fired over BLE.
+        """
+        state = self.state
+        if state.model_family != MODEL_C20:
+            return "only a Mouse Trap can be fired remotely"
+        if state.c20_device_state is None or state.last_gatt_poll is None:
+            return "trap state not read yet"
+        if dt_util.utcnow() - state.last_gatt_poll > C20_TEST_FIRE_STATE_MAX_AGE:
+            return "trap state is out of date"
+        if state.c20_device_state == "ERROR":
+            return "trap error"
+        if state.c20_usb_state == "CONNECTED":
+            return "on the charger"
+        if state.c20_kill_state == "DETECTED":
+            return "kill not cleared"
+        if state.c20_tray_state == "OPEN":
+            return "tray open"
+        return None
+
     async def async_test_fire(self) -> bool:
-        """Test fire a C20 (A24 has no BLE test fire)."""
-        if self.state.model_family != MODEL_C20:
-            self.state.last_gatt_error = "Test fire is only supported on the C20"
+        """Test fire a Mouse Trap, only if the app's conditions hold."""
+        if (why := self.test_fire_blocked()) is not None:
+            self.state.last_gatt_error = f"Test fire blocked: {why}"
             self.async_set_updated_data(None)
-            return False
+            raise HomeAssistantError(f"Test fire blocked: {why}")
         return await self._async_c20_set_command(C20_COMMAND_FIRE, action="test_fire")
 
     async def _async_c20_set_command(self, command: int, *, action: str) -> bool:
@@ -856,6 +901,7 @@ class GoodnatureCoordinator(DataUpdateCoordinator[None]):
                     queue.put_nowait(bytes(data))
 
                 await client.start_notify(NORDIC_UART_TX_UUID, _on_notify)
+                await self._async_c20_wake(client, queue)
                 command_response = await self._async_c20_request_response(
                     client,
                     queue,
@@ -1022,6 +1068,19 @@ class GoodnatureCoordinator(DataUpdateCoordinator[None]):
             return None
         return dt_util.utc_from_timestamp(value)
 
+    async def _async_c20_wake(
+        self, client: BleakClient, queue: asyncio.Queue[bytes]
+    ) -> None:
+        """Send WAKE, as the app does first in every session. Optional: older
+        firmware may not answer, which does not fail the session."""
+        await self._async_c20_request_response(
+            client,
+            queue,
+            C20_TYPE_SET_COMMAND,
+            payload=C20_COMMAND_WAKE.to_bytes(4, byteorder="little", signed=False),
+            request_subtype=C20_SET_TIME_SUBTYPE,
+        )
+
     def _apply_c20_device_state(self, payload: bytes) -> None:
         """Apply DeviceStateResponse payload (type 0x10)."""
         if len(payload) < 14:
@@ -1034,7 +1093,8 @@ class GoodnatureCoordinator(DataUpdateCoordinator[None]):
         self.state.c20_battery_state = self._enum_at(C20_BATTERY_STATE, payload[7])
         self.state.c20_charge_state = self._enum_at(C20_CHARGE_STATE, payload[8])
         self.state.c20_usb_state = self._enum_at(C20_USB_STATE, payload[9])
-        self.state.c20_strike_count = self._parse_u32_le(payload, 10)
+        # [10..13] is not the lifetime total (read 0 on a trap advertising 14),
+        # so it does not touch the strike count.
 
     def _apply_c20_battery_level(self, payload: bytes) -> None:
         """Apply BatteryLevelResponse payload (type 0x11)."""
@@ -1056,13 +1116,16 @@ class GoodnatureCoordinator(DataUpdateCoordinator[None]):
         rewind_time_ms = self._parse_u32_le(payload, 17)
         backdrive_time_ms = self._parse_u32_le(payload, 25) if len(payload) >= 29 else None
 
+        del strike_count  # [4..7]: meaning unknown (read 8 with one kill logged)
         event_dt = self._u32_to_datetime(event_time)
+        source = self._enum_at(C20_STRIKER_SOURCE, source_idx)
         self.state.c20_device_time = event_dt or self.state.c20_device_time
-        self.state.c20_strike_count = strike_count or self.state.c20_strike_count
-        self.state.c20_last_kill_at = event_dt or self.state.c20_last_kill_at
-        self.state.last_activation = event_dt or self.state.last_activation
-        self.state.last_strike_at = event_dt or self.state.last_strike_at
-        self.state.c20_last_striker_source = self._enum_at(C20_STRIKER_SOURCE, source_idx)
+        if source == "TRIGGER":
+            # Only a sensor-triggered strike is a kill; test fires (USER) and
+            # motor self-tests (BACKDRIVE_TEST) are not.
+            self.state.c20_last_kill_at = event_dt or self.state.c20_last_kill_at
+            self.state.last_strike_at = event_dt or self.state.last_strike_at
+        self.state.c20_last_striker_source = source
         self.state.c20_last_trigger_number = trigger_number
         self.state.c20_last_fire_time_ms = fire_time_ms
         self.state.c20_last_rewind_time_ms = rewind_time_ms
@@ -1077,6 +1140,7 @@ class GoodnatureCoordinator(DataUpdateCoordinator[None]):
 
         await client.start_notify(NORDIC_UART_TX_UUID, _on_notify)
         try:
+            await self._async_c20_wake(client, queue)
             if self.write_time_on_connect:
                 now_seconds = int(dt_util.utcnow().timestamp())
                 await self._async_c20_request_response(
