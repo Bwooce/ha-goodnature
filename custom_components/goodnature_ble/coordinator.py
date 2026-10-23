@@ -383,6 +383,16 @@ class GoodnatureCoordinator(DataUpdateCoordinator[None]):
         raw = getattr(service_info, "raw", None)
         adv = parse_a24_advertisement(raw)
         if adv is not None:
+            self.logger.debug(
+                "%s A24 advert: flags=0x%02x unread=%s kills_low8=%s battery=%s/%s rssi=%s",
+                self.address,
+                adv.flags,
+                adv.unread_kills,
+                adv.kill_count_low8,
+                adv.battery_raw,
+                adv.battery_internal_resistance,
+                service_info.rssi,
+            )
             self._set_model_family(MODEL_A24, source="a24_advertisement")
             state.serial_number = adv.serial_number or state.serial_number
             state.adv_flags = adv.flags
@@ -569,6 +579,7 @@ class GoodnatureCoordinator(DataUpdateCoordinator[None]):
                 return False
 
             client: BleakClient | None = None
+            ops: A24Session | None = None
             try:
                 client = await self._async_connect_client(ble_device)
                 ops = A24Session(client)
@@ -582,14 +593,22 @@ class GoodnatureCoordinator(DataUpdateCoordinator[None]):
                 state.last_gatt_error = None
                 state.sync_requested = False
                 self.logger.debug(
-                    "A24 sync for %s (%s): %s", self.address, reason, result
+                    "A24 sync for %s (%s) done, ack confirmed=%s: %s",
+                    self.address,
+                    reason,
+                    result.get("ack_confirmed"),
+                    "; ".join(ops.steps),
                 )
                 return True
             except Exception as err:  # noqa: BLE001
                 state.gatt_failures += 1
                 state.last_gatt_error = str(err) or type(err).__name__
                 self.logger.debug(
-                    "A24 sync failed for %s (%s): %s", self.address, reason, err
+                    "A24 sync failed for %s (%s): %r; steps: %s",
+                    self.address,
+                    reason,
+                    err,
+                    "; ".join(ops.steps) if ops else "connect failed",
                 )
                 return False
             finally:
@@ -1168,19 +1187,25 @@ class A24Session:
 
     def __init__(self, client: Any) -> None:
         self._client = client
-        self.log: list[tuple[str, str, bytes | None]] = []
+        # One line per operation, for debug logs.
+        self.steps: list[str] = []
 
     async def _read(self, short_id: str) -> bytes | None:
         try:
             value = await self._client.read_gatt_char(U[short_id])
-        except Exception:  # noqa: BLE001
-            value = None
-        self.log.append(("read", short_id, None if value is None else bytes(value)))
-        return None if value is None else bytes(value)
+        except Exception as err:  # noqa: BLE001
+            self.steps.append(f"read {short_id} failed: {err!r}")
+            return None
+        self.steps.append(f"read {short_id} {bytes(value).hex()}")
+        return bytes(value)
 
     async def _write(self, short_id: str, value: bytes) -> None:
-        self.log.append(("write", short_id, value))
-        await self._client.write_gatt_char(U[short_id], value, response=True)
+        try:
+            await self._client.write_gatt_char(U[short_id], value, response=True)
+        except Exception as err:
+            self.steps.append(f"write {short_id} {value.hex()} failed: {err!r}")
+            raise
+        self.steps.append(f"write {short_id} {value.hex()} ok")
 
     async def run(self, *, write_time: bool, now: datetime) -> dict[str, Any]:
         """Run the session and return what was read.
@@ -1220,7 +1245,8 @@ class A24Session:
         # which is the normal end of a session, not a failure.
         try:
             await self._write("DE13", bytes([A24_CONTROL_SYNC_DONE]))
+            result["ack_confirmed"] = True
         except Exception:  # noqa: BLE001
-            pass
+            result["ack_confirmed"] = False
         result["acknowledged"] = True
         return result

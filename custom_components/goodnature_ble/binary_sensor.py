@@ -48,6 +48,7 @@ class GoodnatureBinarySpec:
     entity_category: EntityCategory | None = EntityCategory.DIAGNOSTIC
     models: frozenset[str] | None = None
     icon: str | None = None
+    enabled_by_default: bool = True
 
 
 SPECS: tuple[GoodnatureBinarySpec, ...] = (
@@ -68,12 +69,16 @@ SPECS: tuple[GoodnatureBinarySpec, ...] = (
         is_on_fn=lambda s: s.low_battery,
         models=A24_ONLY,
     ),
+    # The trap sets this bit when it hangs up on the "sync done" write before
+    # confirming it, which is normal through a proxy, so it is not a fault.
     GoodnatureBinarySpec(
         key="a24_new_error",
-        name="Trap Error Flag",
-        device_class=BinarySensorDeviceClass.PROBLEM,
+        name="Error Record Flag",
+        device_class=None,
         is_on_fn=lambda s: s.new_error,
         models=A24_ONLY,
+        icon="mdi:flag-outline",
+        enabled_by_default=False,
     ),
     # C20
     GoodnatureBinarySpec(
@@ -161,6 +166,7 @@ class GoodnatureBinarySensor(GoodnatureEntity, BinarySensorEntity):
         self._attr_entity_category = spec.entity_category
         if spec.icon:
             self._attr_icon = spec.icon
+        self._attr_entity_registry_enabled_default = spec.enabled_by_default
 
     @property
     def is_on(self) -> bool | None:

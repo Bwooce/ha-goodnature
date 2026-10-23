@@ -92,9 +92,12 @@ async def test_sync_reads_newest_record_then_acknowledges_last() -> None:
 
 async def test_trap_hanging_up_on_ack_is_not_a_failure() -> None:
     client = FakeClient(base_values(), fail_writes={"DE13"})
-    result = await A24Session(client).run(write_time=True, now=NOW)
+    session = A24Session(client)
+    result = await session.run(write_time=True, now=NOW)
     assert result["acknowledged"] is True
+    assert result["ack_confirmed"] is False
     assert client.ops[-1] == ("write", "DE13", b"\x02")
+    assert session.steps[-1].startswith("write DE13 02 failed")
 
 
 async def test_no_acknowledgement_if_record_read_fails() -> None:

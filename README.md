@@ -37,7 +37,7 @@ A24 changes in 0.3.0:
 - Fixed the device name being overwritten with the advertised `GN\0\0`.
 
 A24 entities: Strikes, Kill Alert, Last Strike, Last Strike Temperature, Battery Voltage,
-Battery Status, Battery Low, Unread Kills, Trap Error Flag, Last Seen, Last Sync, Signal Strength,
+Battery Status, Battery Low, Unread Kills, Last Seen, Last Sync, Signal Strength,
 Poll Now, Clear Kill Alert. **Poll Now** syncs immediately if the trap is awake, otherwise at its
 next wake-up; an A24 cannot be woken over Bluetooth.
 
