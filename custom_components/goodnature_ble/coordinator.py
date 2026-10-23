@@ -6,6 +6,7 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from collections.abc import Callable
 from typing import Any
 
 from homeassistant.components.bluetooth import (
@@ -13,6 +14,7 @@ from homeassistant.components.bluetooth import (
     BluetoothCallbackMatcher,
     BluetoothScanningMode,
     BluetoothServiceInfoBleak,
+    async_address_present,
     async_ble_device_from_address,
     async_register_callback,
 )
@@ -49,6 +51,7 @@ from .const import (
 from .protocol import (
     A24_CONTROL_SYNC_DONE,
     APPLE_COMPANY_ID,
+    C20FrameAssembler,
     UUIDS,
     a24_battery_status,
     a24_battery_volts,
@@ -91,6 +94,7 @@ C20_TYPE_FIRMWARE = 0x08
 C20_TYPE_DEVICE_STATE = 0x10
 C20_TYPE_BATTERY_LEVEL = 0x11
 C20_TYPE_SET_COMMAND = 0x12
+C20_TYPE_KILL_HISTORY = 0x14
 C20_TYPE_LOGS = 0x40
 C20_TYPE_LOG_EVENT = 0x45
 C20_TYPE_STRIKER_EVENT = 0x31
@@ -219,9 +223,12 @@ class TrapState:
     c20_kill_history_raw: str | None = None
     c20_last_striker_source: str | None = None
     c20_last_trigger_number: int | None = None
-    c20_last_fire_time_ms: int | None = None
-    c20_last_rewind_time_ms: int | None = None
-    c20_last_backdrive_time_ms: int | None = None
+    # Durations as reported; the observed values only make sense as microseconds.
+    c20_last_fire_time_us: int | None = None
+    c20_last_rewind_time_us: int | None = None
+    c20_last_backdrive_time_us: int | None = None
+    # End of the last log window the trap fully answered (epoch seconds).
+    c20_log_scanned_to: int | None = None
 
     last_gatt_poll: datetime | None = None
     gatt_failures: int = 0
@@ -323,8 +330,14 @@ class GoodnatureCoordinator(DataUpdateCoordinator[None]):
             )
 
         now = dt_util.utcnow()
-        if self.state.model_family == MODEL_C20 and self._should_poll_gatt(now):
-            self._schedule_gatt_refresh(reason="periodic")
+        if self.state.model_family == MODEL_C20:
+            # Home Assistant does not call back for an advert identical to the
+            # previous one, and a Mouse Trap's advert can stay the same for
+            # days, so ask the Bluetooth manager whether it is still around.
+            if async_address_present(self.hass, self.address, connectable=False):
+                self.state.last_seen = now
+            if self._should_poll_gatt(now):
+                self._schedule_gatt_refresh(reason="periodic")
 
         # Entities are chosen by model at setup. When the model was unknown
         # then and has since been identified, reload once to drop the other
@@ -508,6 +521,18 @@ class GoodnatureCoordinator(DataUpdateCoordinator[None]):
         service_uuids = _normalized_service_uuids(service_info)
         has_a24_markers = gn_uuid("D00D") in service_uuids or gn_uuid("D2ED") in service_uuids
 
+        # Read the Mouse Trap payload before classifying: a scan response may
+        # add C20 service UUIDs, which used to return before this was parsed.
+        manufacturer_data = service_info.manufacturer_data or {}
+        mfg_payload = manufacturer_data.get(MFG_GOODNATURE)
+        c20_advertisement = (
+            parse_c20_advertisement(mfg_payload)
+            if "0000600d-0000-1000-8000-00805f9b34fb" in service_uuids
+            else None
+        )
+        if c20_advertisement is not None and self.state.model_family != MODEL_A24:
+            self._apply_c20_advertisement(c20_advertisement)
+
         # C20-like profile from observed service patterns and on-device captures.
         if (
             gn_uuid("E010") in service_uuids
@@ -522,48 +547,28 @@ class GoodnatureCoordinator(DataUpdateCoordinator[None]):
             self._set_model_family(MODEL_A24, source="service_profile")
             return
 
-        # Heuristic fallback: C20-like payload shape seen on GN advertisements.
-        manufacturer_data = service_info.manufacturer_data or {}
-        mfg_payload = manufacturer_data.get(MFG_GOODNATURE)
-        c20_advertisement = (
-            parse_c20_advertisement(mfg_payload)
-            if "0000600d-0000-1000-8000-00805f9b34fb" in service_uuids
-            else None
-        )
-        if c20_advertisement is not None:
-            self.state.serial_number = c20_advertisement.serial_number
-            self.state.c20_device_type = c20_advertisement.device_type
-            # Not derived from the advert: armed Mouse Traps were observed
-            # sending 0x04, never the documented 0x01 (kedube notes), so the
-            # device state only comes from the UART poll.
-            self.state.c20_kill_state = (
-                "DETECTED" if c20_advertisement.strikes_available else "CLEARED"
-            )
-            # Byte 8 is the battery state enumeration (4 = NORMAL), not a
-            # percentage; the percentage only comes from the UART poll.
-            self.state.c20_battery_state = self._enum_at(
-                C20_BATTERY_STATE, c20_advertisement.battery_state_raw
-            )
-            self.state.c20_charge_state = (
-                "CHARGING" if c20_advertisement.charging else "NOT_CHARGING"
-            )
-            self.state.c20_usb_state = (
-                "CONNECTED" if c20_advertisement.usb_connected else "DISCONNECTED"
-            )
-            self.state.c20_discoverable = c20_advertisement.discoverable
-            # The advert's count matches the app's lifetime total.
-            self.state.c20_strike_count = c20_advertisement.strike_count
-
-        if (
-            mfg_payload
-            and len(mfg_payload) == 9
-            and not has_a24_markers
-            and "0000600d-0000-1000-8000-00805f9b34fb" in service_uuids
-        ):
+        if c20_advertisement is not None and not has_a24_markers:
             self._set_model_family(MODEL_C20, source="manufacturer_shape")
-            return
 
-        # Keep unknown unless explicit A24/C20 markers are observed.
+    def _apply_c20_advertisement(self, adv: Any) -> None:
+        """Apply the Mouse Trap's 9-byte advert (kedube notes; three real traps
+        agree on the layout of bytes 0-3, 6-7 and 8)."""
+        state = self.state
+        state.serial_number = adv.serial_number
+        state.c20_device_type = adv.device_type
+        # The armed state is not taken from the advert: armed traps send 0x04,
+        # never the documented 0x01. It comes from the UART poll.
+        state.c20_kill_state = "DETECTED" if adv.strikes_available else "CLEARED"
+        # Byte 8 is the battery state (4 = NORMAL), not a percentage; the app
+        # also uses flag 0x08 for its low-battery check.
+        state.c20_battery_state = (
+            "LOW" if adv.low_battery else self._enum_at(C20_BATTERY_STATE, adv.battery_state_raw)
+        )
+        state.c20_charge_state = "CHARGING" if adv.charging else "NOT_CHARGING"
+        state.c20_usb_state = "CONNECTED" if adv.usb_connected else "DISCONNECTED"
+        state.c20_discoverable = adv.discoverable
+        # Lifetime striker counter; may include test fires (see README).
+        state.c20_strike_count = adv.strike_count
 
     def _set_model_family(self, family: str, *, source: str) -> None:
         """Set model family with conservative precedence.
@@ -773,11 +778,7 @@ class GoodnatureCoordinator(DataUpdateCoordinator[None]):
         if self._gatt_lock.locked():
             return False
 
-        if self.state.last_seen is None:
-            return False
-
-        # Prefer polling while device is actively advertising.
-        if now - self.state.last_seen > self.active_window:
+        if not async_address_present(self.hass, self.address, connectable=False):
             return False
 
         state = self.state
@@ -808,10 +809,12 @@ class GoodnatureCoordinator(DataUpdateCoordinator[None]):
             return
 
         async with self._gatt_lock:
-            ble_device = self._async_resolve_ble_device()
+            ble_device = self._async_resolve_ble_device(connectable_only=True)
             if ble_device is None:
                 self.state.gatt_failures += 1
-                self.state.last_gatt_error = "BLE device not available"
+                self.state.consecutive_sync_failures += 1
+                self.state.last_sync_attempt = dt_util.utcnow()
+                self.state.last_gatt_error = "No connectable Bluetooth path to the trap"
                 self.async_set_updated_data(None)
                 return
 
@@ -877,75 +880,73 @@ class GoodnatureCoordinator(DataUpdateCoordinator[None]):
             self.state.last_gatt_error = f"Test fire blocked: {why}"
             self.async_set_updated_data(None)
             raise HomeAssistantError(f"Test fire blocked: {why}")
-        return await self._async_c20_set_command(C20_COMMAND_FIRE, action="test_fire")
+        return await self._async_c20_set_command(
+            C20_COMMAND_FIRE, action="test_fire", precheck=self.test_fire_blocked
+        )
 
-    async def _async_c20_set_command(self, command: int, *, action: str) -> bool:
-        """Send a C20 SetCommandRequest using the app protocol."""
+    async def _async_c20_set_command(
+        self,
+        command: int,
+        *,
+        action: str,
+        precheck: Callable[[], str | None] | None = None,
+    ) -> bool:
+        """Send a C20 SetCommandRequest (after WAKE), as the app does.
+
+        Delivery is judged by the write succeeding: the trap's echo is only
+        documented for WAKE, so a missing echo is reported but the command is
+        not resent (a resent FIRE would fire twice).
+        """
         if BleakClient is None:
             return False
 
         async with self._gatt_lock:
-            ble_device = self._async_resolve_ble_device()
+            if precheck is not None and (why := precheck()) is not None:
+                # State may have changed while waiting for the lock.
+                self.state.last_gatt_error = f"{action} blocked: {why}"
+                self.async_set_updated_data(None)
+                raise HomeAssistantError(f"{action.replace('_', ' ').capitalize()} blocked: {why}")
+            ble_device = self._async_resolve_ble_device(connectable_only=True)
             if ble_device is None:
                 self.state.gatt_failures += 1
-                self.state.last_gatt_error = "BLE device not available"
+                self.state.last_gatt_error = "No connectable Bluetooth path to the trap"
                 self.async_set_updated_data(None)
                 return False
 
             client: BleakClient | None = None
             try:
                 client = await self._async_connect_client(ble_device)
-                queue: asyncio.Queue[bytes] = asyncio.Queue()
-
-                def _on_notify(_: int, data: bytearray) -> None:
-                    queue.put_nowait(bytes(data))
-
-                await client.start_notify(NORDIC_UART_TX_UUID, _on_notify)
+                queue, on_notify = self._c20_uart_queue()
+                await client.start_notify(NORDIC_UART_TX_UUID, on_notify)
                 await self._async_c20_wake(client, queue)
-                command_response = await self._async_c20_request_response(
-                    client,
-                    queue,
-                    C20_TYPE_SET_COMMAND,
-                    payload=command.to_bytes(4, byteorder="little", signed=False),
-                    request_subtype=C20_SET_TIME_SUBTYPE,
+                command_bytes = command.to_bytes(4, byteorder="little", signed=False)
+                request = self._encode_c20_message(
+                    C20_TYPE_SET_COMMAND, C20_SET_TIME_SUBTYPE, command_bytes
                 )
-                ok = command_response is not None
-
-                if not ok:
+                if not await self._async_write_char(client, NORDIC_UART_RX_UUID, request):
                     self.state.gatt_failures += 1
-                    self.state.last_gatt_error = f"C20 {action} command failed"
-                    self.async_set_updated_data(None)
+                    self.state.last_gatt_error = f"C20 {action} command could not be sent"
                     return False
 
-                # Allow immediate async event notifications (state/striker event) to land.
+                echo = await self._async_c20_wait_response(
+                    queue, C20_TYPE_SET_COMMAND, expect_payload=command_bytes
+                )
+                self.state.last_gatt_error = (
+                    None if echo is not None else f"C20 {action} sent, no acknowledgement"
+                )
+
+                # Let asynchronous state and striker events land.
                 end_at = self.hass.loop.time() + 2.0
-                while True:
-                    remaining = end_at - self.hass.loop.time()
-                    if remaining <= 0:
-                        break
+                while (remaining := end_at - self.hass.loop.time()) > 0:
                     try:
                         raw = await asyncio.wait_for(queue.get(), timeout=remaining)
                     except asyncio.TimeoutError:
                         break
-                    decoded = self._decode_c20_frame(raw)
-                    if decoded is None:
-                        continue
-                    message_type, subtype, payload = decoded
-                    if subtype != C20_RESPONSE_SUBTYPE:
-                        continue
-                    if message_type == C20_TYPE_DEVICE_STATE:
-                        self._apply_c20_device_state(payload)
-                    elif message_type == C20_TYPE_STRIKER_EVENT:
-                        self._apply_c20_striker_event(payload)
-
-                self.state.last_gatt_poll = dt_util.utcnow()
-                self.state.last_gatt_error = None
-                self.async_set_updated_data(None)
+                    self._apply_c20_async_frame(raw)
                 return True
             except Exception as err:  # noqa: BLE001
                 self.state.gatt_failures += 1
                 self.state.last_gatt_error = str(err)
-                self.async_set_updated_data(None)
                 return False
             finally:
                 if client and client.is_connected:
@@ -963,7 +964,28 @@ class GoodnatureCoordinator(DataUpdateCoordinator[None]):
                             action,
                             err,
                         )
+                self.async_set_updated_data(None)
 
+    def _c20_uart_queue(self) -> tuple[asyncio.Queue[bytes], Callable[[int, bytearray], None]]:
+        """A queue of whole UART frames and the notify callback that fills it."""
+        queue: asyncio.Queue[bytes] = asyncio.Queue()
+        assembler = C20FrameAssembler()
+
+        def _on_notify(_: int, data: bytearray) -> None:
+            for frame in assembler.feed(bytes(data)):
+                queue.put_nowait(frame)
+
+        return queue, _on_notify
+
+    def _apply_c20_async_frame(self, raw: bytes) -> None:
+        """Apply an unsolicited device-state or striker-event frame."""
+        decoded = self._decode_c20_frame(raw)
+        if decoded is None or decoded[1] != C20_RESPONSE_SUBTYPE:
+            return
+        if decoded[0] == C20_TYPE_DEVICE_STATE:
+            self._apply_c20_device_state(decoded[2])
+        elif decoded[0] == C20_TYPE_STRIKER_EVENT:
+            self._apply_c20_striker_event(decoded[2])
 
     def _decode_c20_frame(self, frame: bytes) -> tuple[int, int, bytes] | None:
         """Decode a single C20 UART frame into (message_type, subtype, payload)."""
@@ -1004,7 +1026,8 @@ class GoodnatureCoordinator(DataUpdateCoordinator[None]):
         crc = self._crc16_ccitt(body).to_bytes(2, byteorder="little", signed=False)
         escaped = bytearray()
         for value in body + crc:
-            if value in (0xB0, 0xB1):
+            # B2 too: the app's own decoder treats any B2 as an escape.
+            if value in (0xB0, 0xB1, 0xB2):
                 escaped.append(0xB2)
                 escaped.append(value ^ 0x04)
             else:
@@ -1021,11 +1044,28 @@ class GoodnatureCoordinator(DataUpdateCoordinator[None]):
         request_subtype: int = C20_REQUEST_SUBTYPE,
         timeout: float = C20_UART_TIMEOUT_SECONDS,
     ) -> bytes | None:
-        """Send one C20 UART request and wait for matching response payload."""
+        """Send one C20 UART request and wait for the matching response payload."""
         request = self._encode_c20_message(message_type, request_subtype, payload)
         if not await self._async_write_char(client, NORDIC_UART_RX_UUID, request):
             return None
+        expect = payload if message_type == C20_TYPE_SET_COMMAND else None
+        return await self._async_c20_wait_response(
+            queue, message_type, expect_payload=expect, timeout=timeout
+        )
 
+    async def _async_c20_wait_response(
+        self,
+        queue: asyncio.Queue[bytes],
+        message_type: int,
+        *,
+        expect_payload: bytes | None = None,
+        timeout: float = C20_UART_TIMEOUT_SECONDS,
+    ) -> bytes | None:
+        """Wait for a response frame of message_type.
+
+        For set commands the echoed command must match, so a late WAKE echo
+        is not taken as the FIRE acknowledgement.
+        """
         end_at = self.hass.loop.time() + timeout
         while True:
             remaining = end_at - self.hass.loop.time()
@@ -1041,13 +1081,14 @@ class GoodnatureCoordinator(DataUpdateCoordinator[None]):
                 continue
             response_type, response_subtype, response_payload = decoded
             if response_type == message_type and response_subtype == C20_RESPONSE_SUBTYPE:
+                if (
+                    expect_payload is not None
+                    and len(response_payload) >= len(expect_payload)
+                    and response_payload[: len(expect_payload)] != expect_payload
+                ):
+                    continue
                 return response_payload
-
-            # Keep state in sync when asynchronous striker events arrive.
-            if response_type == C20_TYPE_DEVICE_STATE and response_subtype == C20_RESPONSE_SUBTYPE:
-                self._apply_c20_device_state(response_payload)
-            elif response_type == C20_TYPE_STRIKER_EVENT and response_subtype == C20_RESPONSE_SUBTYPE:
-                self._apply_c20_striker_event(response_payload)
+            self._apply_c20_async_frame(raw)
 
     def _enum_at(self, values: tuple[str, ...], index: int) -> str:
         """Return enum label for index with NO_DATA fallback."""
@@ -1096,6 +1137,18 @@ class GoodnatureCoordinator(DataUpdateCoordinator[None]):
         # [10..13] is not the lifetime total (read 0 on a trap advertising 14),
         # so it does not touch the strike count.
 
+    def _apply_c20_kill_history(self, payload: bytes) -> None:
+        """KillHistoryResponse (0x14): ten u32 kill times (epoch s, 0 = empty)."""
+        if len(payload) < 40:
+            return
+        times = [self._parse_u32_le(payload, i) or 0 for i in range(0, 40, 4)]
+        now = dt_util.utcnow().timestamp()
+        plausible = [t for t in times if MIN_PLAUSIBLE_EPOCH <= t <= now + 120]
+        if plausible:
+            newest = self._u32_to_datetime(max(plausible))
+            if self.state.c20_last_kill_at is None or newest > self.state.c20_last_kill_at:
+                self.state.c20_last_kill_at = newest
+
     def _apply_c20_battery_level(self, payload: bytes) -> None:
         """Apply BatteryLevelResponse payload (type 0x11)."""
         if len(payload) < 5:
@@ -1112,9 +1165,9 @@ class GoodnatureCoordinator(DataUpdateCoordinator[None]):
         strike_count = self._parse_u32_le(payload, 4)
         source_idx = payload[8]
         trigger_number = self._parse_u32_le(payload, 9)
-        fire_time_ms = self._parse_u32_le(payload, 13)
-        rewind_time_ms = self._parse_u32_le(payload, 17)
-        backdrive_time_ms = self._parse_u32_le(payload, 25) if len(payload) >= 29 else None
+        fire_time = self._parse_u32_le(payload, 13)
+        rewind_time = self._parse_u32_le(payload, 17)
+        backdrive_time = self._parse_u32_le(payload, 25) if len(payload) >= 29 else None
 
         del strike_count  # [4..7]: meaning unknown (read 8 with one kill logged)
         event_dt = self._u32_to_datetime(event_time)
@@ -1127,18 +1180,14 @@ class GoodnatureCoordinator(DataUpdateCoordinator[None]):
             self.state.last_strike_at = event_dt or self.state.last_strike_at
         self.state.c20_last_striker_source = source
         self.state.c20_last_trigger_number = trigger_number
-        self.state.c20_last_fire_time_ms = fire_time_ms
-        self.state.c20_last_rewind_time_ms = rewind_time_ms
-        self.state.c20_last_backdrive_time_ms = backdrive_time_ms
+        self.state.c20_last_fire_time_us = fire_time
+        self.state.c20_last_rewind_time_us = rewind_time
+        self.state.c20_last_backdrive_time_us = backdrive_time
 
     async def _async_refresh_c20_uart(self, client: BleakClient) -> None:
         """Refresh C20 telemetry using the observed UART request/response flow."""
-        queue: asyncio.Queue[bytes] = asyncio.Queue()
-
-        def _on_notify(_: int, data: bytearray) -> None:
-            queue.put_nowait(bytes(data))
-
-        await client.start_notify(NORDIC_UART_TX_UUID, _on_notify)
+        queue, on_notify = self._c20_uart_queue()
+        await client.start_notify(NORDIC_UART_TX_UUID, on_notify)
         try:
             await self._async_c20_wake(client, queue)
             if self.write_time_on_connect:
@@ -1163,8 +1212,16 @@ class GoodnatureCoordinator(DataUpdateCoordinator[None]):
                 self._apply_c20_battery_level(battery)
 
             device_state = await self._async_c20_request_response(client, queue, C20_TYPE_DEVICE_STATE)
-            if device_state is not None:
-                self._apply_c20_device_state(device_state)
+            if device_state is None:
+                # Without the state the poll proves nothing; fail it so it backs
+                # off and the test-fire freshness check is not satisfied.
+                raise RuntimeError("Mouse Trap did not report its state (0x10)")
+            self._apply_c20_device_state(device_state)
+
+            # Kill history (app 3.6.1 on firmware after 0.2.550); optional.
+            history = await self._async_c20_request_response(client, queue, C20_TYPE_KILL_HISTORY)
+            if history is not None:
+                self._apply_c20_kill_history(history)
 
             await self._async_refresh_c20_history(client, queue)
         finally:
@@ -1178,10 +1235,11 @@ class GoodnatureCoordinator(DataUpdateCoordinator[None]):
     ) -> None:
         """Fetch C20 striker history using the app's LogsRequest flow."""
         end_seconds = int(dt_util.utcnow().timestamp())
+        # Continue from the last window the trap fully answered, with a 2 min
+        # overlap; never start at 0 (the trap then never sends the terminator).
+        scanned_to = self.state.c20_log_scanned_to
         start_seconds = (
-            int(self.state.last_gatt_poll.timestamp())
-            if self.state.last_gatt_poll is not None
-            else max(0, end_seconds - 86400)
+            scanned_to - 120 if scanned_to is not None else end_seconds - 86400
         )
         # FLAG_STRIKER_EVENTS is bit 1 in the app.
         payload = (
@@ -1211,6 +1269,7 @@ class GoodnatureCoordinator(DataUpdateCoordinator[None]):
                 continue
             if message_type == C20_TYPE_LOGS:
                 # LogsResponse is the terminator after the streamed LogEvents.
+                self.state.c20_log_scanned_to = end_seconds
                 break
             elif message_type == C20_TYPE_LOG_EVENT:
                 nested = self._decode_c20_frame(response_payload)

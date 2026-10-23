@@ -375,3 +375,40 @@ def parse_c20_advertisement(value: bytes | None) -> C20Advertisement | None:
         strike_count=int.from_bytes(value[6:8], "little"),
         battery_state_raw=value[8],
     )
+
+
+C20_FRAME_START = 0xB0
+C20_FRAME_END = 0xB1
+C20_FRAME_ESCAPE = 0xB2
+C20_MAX_FRAME = 512
+
+
+class C20FrameAssembler:
+    """Reassemble Mouse Trap UART frames from BLE notifications.
+
+    Frames are B0 <escaped body> B1. Inside a frame B0, B1 and B2 only appear
+    escaped (B2 then byte ^ 0x04), so a literal B1 always ends a frame and a
+    literal B0 always starts one. With the default 23-byte ATT MTU a frame can
+    span several notifications, and one notification can hold several frames.
+    """
+
+    def __init__(self) -> None:
+        self._buf = bytearray()
+        self._in_frame = False
+
+    def feed(self, data: bytes) -> list[bytes]:
+        frames: list[bytes] = []
+        for byte in data:
+            if byte == C20_FRAME_START:
+                self._buf = bytearray([byte])
+                self._in_frame = True
+            elif self._in_frame:
+                self._buf.append(byte)
+                if byte == C20_FRAME_END:
+                    frames.append(bytes(self._buf))
+                    self._buf = bytearray()
+                    self._in_frame = False
+                elif len(self._buf) > C20_MAX_FRAME:
+                    self._buf = bytearray()
+                    self._in_frame = False
+        return frames

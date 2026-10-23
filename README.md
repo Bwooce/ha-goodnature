@@ -73,9 +73,23 @@ kedube notes and gateway, which were developed against two Mouse Traps on firmwa
   send 0x04, not the documented 0x01).
 - Only sensor-triggered strikes count as kills (not test fires or motor self-tests).
 - Every session starts with the app's WAKE command.
+- Keeps polling while the trap is present: Home Assistant does not report an advert identical to
+  the previous one, and a Mouse Trap's can stay the same for days, so presence comes from the
+  Bluetooth manager instead of the last advert callback.
+- UART frames are reassembled across notifications (the trap's 20-byte notifications split most
+  responses) and several frames in one notification are separated.
+- Test Fire: the safety conditions are checked again once the Bluetooth link is free (a poll may
+  just have changed them); a FIRE whose write succeeded is never reported as failed or resent, only
+  flagged if the trap does not echo it; an echo must match the command sent.
+- A poll without the trap's state response counts as failed (and backs off).
+- The kill history (0x14, used by the app) sets the last kill time; the log window continues from
+  the last fully answered window with a 2-minute overlap, so command sessions no longer skip kills.
+- The advert is parsed before the model is classified, B2 is escaped when sending (as kedube does;
+  the app's decoder treats any B2 as an escape), and advert flag 0x08 marks the battery low.
 
-Known gaps: the app's kill-history request (0x14) is not used (kills are counted from the
-advertisement), and a Mouse Trap whose Bluetooth address changes would need re-adding.
+Known gaps: Strikes for a Mouse Trap is the advert's lifetime striker counter, which may include
+test fires (kedube saw it read higher than the app's kill count); a Mouse Trap whose Bluetooth
+address changes would need re-adding.
 
 Where the upstream notes below disagree with this section, this section is current.
 

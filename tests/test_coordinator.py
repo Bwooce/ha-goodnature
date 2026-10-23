@@ -180,6 +180,7 @@ async def test_reloads_once_after_model_identified_and_trap_quiet(hass: HomeAssi
     coordinator._async_handle_ble(service_info(ADV + scan_rsp(26)), BluetoothChange.ADVERTISEMENT)
     assert coordinator.state.model_family == MODEL_A24
 
+    coordinator._unsubscribe_ble = lambda: None  # no Bluetooth stack in this test
     with patch.object(hass.config_entries, "async_schedule_reload") as reload:
         await coordinator._async_update_data()  # trap still awake: wait
         reload.assert_not_called()
@@ -197,6 +198,7 @@ async def test_no_reload_when_model_known_at_setup(hass: HomeAssistant) -> None:
     coordinator = make_coordinator(hass)
     coordinator.state.model_family = MODEL_A24
     coordinator.model_at_setup = MODEL_A24
+    coordinator._unsubscribe_ble = lambda: None  # no Bluetooth stack in this test
     with patch.object(hass.config_entries, "async_schedule_reload") as reload:
         await coordinator._async_update_data()
         reload.assert_not_called()
