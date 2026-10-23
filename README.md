@@ -41,6 +41,24 @@ Battery Status, Battery Low, Unread Kills, Last Seen, Last Sync, Signal Strength
 Poll Now, Clear Kill Alert. **Poll Now** syncs immediately if the trap is awake, otherwise at its
 next wake-up; an A24 cannot be woken over Bluetooth.
 
+Changes in 0.3.3, from a byte-by-byte review against the kedube gateway and app notes:
+
+- A failed or missing kill record no longer blocks the acknowledgement (the trap would keep
+  waking); only an unreadable kill count aborts a sync. Failed syncs back off 1, 2, 4 ... 30 min.
+- The advertised kill byte only moves the count forward by less than 128; anything else waits for
+  the next GATT read, which can also lower the count. An advert-only starting count (low 8 bits)
+  is replaced silently by the first full count.
+- Kill Alert also turns on for kills the trap reports as unread, including on first contact, and for
+  kills read but not yet acknowledged on the trap.
+- Kill records with a time before 2017 or in the future, or that are not the newest, are ignored.
+- The newest record is not re-read when it is already known and acknowledged.
+
+Limitation: the A24 status slots are decoded from raw advertisement bytes, which Home Assistant
+provides for ESPHome Bluetooth proxies but not for a local adapter. Through a local adapter the
+trap is still identified (iBeacon) and synced, but advert-only values (unread kills, flags) are not
+available between syncs. Home Assistant does not keep the order of the 16-bit UUID list, so the
+slots cannot be rebuilt from it safely.
+
 Where the upstream notes below disagree with this section for the A24, this section is current.
 
 Tests: `pip install -r requirements_test.txt && pytest`.

@@ -100,7 +100,9 @@ async def test_trap_hanging_up_on_ack_is_not_a_failure() -> None:
     assert session.steps[-1].startswith("write DE13 02 failed")
 
 
-async def test_no_acknowledgement_if_record_read_fails() -> None:
+async def test_record_read_failure_still_acknowledges() -> None:
+    # An unacknowledged trap keeps waking (battery), so a bad record must not
+    # block the kill-count acknowledgement, the time and "sync done".
     client = FakeClient(base_values())
     client.write_gatt_char_orig = client.write_gatt_char
 
@@ -109,9 +111,33 @@ async def test_no_acknowledgement_if_record_read_fails() -> None:
         client.values["D30D"] = None  # record read will fail
 
     client.write_gatt_char = write_without_record
-    with pytest.raises(RuntimeError, match="D30D"):
-        await A24Session(client).run(write_time=True, now=NOW)
-    assert [s for s, _ in client.writes()] == ["D20D"]
+    result = await A24Session(client).run(write_time=True, now=NOW)
+    assert [s for s, _ in client.writes()] == ["D20D", "D60D", "F1AF", "DE13"]
+    assert "record" not in result
+    assert "D30D" in result["record_error"]
+    assert result["acknowledged"] is True
+
+
+async def test_refused_selector_skips_record_but_acknowledges() -> None:
+    client = FakeClient(base_values(), fail_writes={"D20D"})
+    result = await A24Session(client).run(write_time=True, now=NOW)
+    assert [s for s, _ in client.writes()] == ["D20D", "D60D", "F1AF", "DE13"]
+    assert [s for op, s, _ in client.ops if op == "read"].count("D30D") == 0
+    assert "D20D" in result["record_error"]
+
+
+async def test_failed_kill_ack_keeps_read_pointer() -> None:
+    client = FakeClient(base_values(), fail_writes={"D60D"})
+    result = await A24Session(client).run(write_time=True, now=NOW)
+    assert result["kill_read"] == 25
+    assert result["kill_read_before"] == 25
+    assert client.ops[-1] == ("write", "DE13", b"\x02")
+
+
+async def test_known_record_is_not_reread() -> None:
+    client = FakeClient(base_values(D60D=b"\x1a\x00"))
+    await A24Session(client).run(write_time=True, now=NOW, known_record=26)
+    assert [s for s, _ in client.writes()] == ["F1AF", "DE13"]
 
 
 async def test_no_writes_if_kill_count_unreadable() -> None:

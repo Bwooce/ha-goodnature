@@ -4,12 +4,15 @@ Expected values come from sources independent of this code:
 - "kedube" = worked examples in kedube/ha-goodnature-gateway docs/ble-protocol.md
   (captures from a real A24 Smart Cap, firmware 1.3.0, with their stated decodes).
 - "live" = a capture from an A24 Chirp at D3:58:7F:15:99:0B on 2026-10-23, whose
-  kill count (26) was confirmed independently by a GATT read of D20D.
+  kill count (26) was confirmed independently by a GATT read of D20D, and whose
+  serial (E33BC98F) and firmware (1.1.3) were read off the Goodnature app.
+- "gist" = codyc1515's 2022 Chirp notes (F1AF example 27508333 <-> 6dbea301).
 """
 
 from datetime import UTC, datetime
 
 from custom_components.goodnature_ble.protocol import (
+    encode_minutes_now,
     a24_battery_status,
     a24_battery_volts,
     clean_name,
@@ -121,8 +124,8 @@ def test_live_capture_kill_count() -> None:
     assert adv is not None
     assert adv.kill_count_low8 == 26  # confirmed by GATT D20D = 26
     assert adv.unread_kills == 0
-    # Derived with the same formula/layout (not independently confirmed):
-    assert adv.serial_number == "E33BC98F"
+    assert adv.serial_number == "E33BC98F"  # matches the Goodnature app
+    # Derived with the app-decompiled formula (no independent reading):
     assert adv.battery_volts == 3.06
 
 
@@ -147,3 +150,25 @@ def test_clean_name() -> None:
     assert clean_name("GN\x00\x00") == "GN"
     assert clean_name("\x00") is None
     assert clean_name(None) is None
+
+
+def test_live_identity_matches_goodnature_app() -> None:
+    # DE12 / DE15 bytes read from the trap; app shows E33BC98F and 1.1.3.
+    assert serial_from_bytes(bytes.fromhex("8fc93be3")) == "E33BC98F"
+    assert firmware_from_bytes(bytes.fromhex("010103")) == "1.1.3"
+
+
+def test_live_d30d_record() -> None:
+    # Read from the trap at 2026-10-23 09:56 UTC; the original integration
+    # (independent code) displayed the same record time.
+    record = parse_d30d(bytes.fromhex("c58fc93be30b00f4c6011a00"))
+    assert record.record_number == 26
+    assert record.strike_at == datetime(2026, 9, 9, 10, 8, tzinfo=UTC)
+    assert record.temperature_c == 11
+    assert record.serial_number == "E33BC98F"
+
+
+def test_gist_time_encoding() -> None:
+    # gist: 1650500007224 ms -> 27508333 minutes -> "6dbea301"
+    now = datetime.fromtimestamp(1650500007.224, tz=UTC)
+    assert encode_minutes_now(now) == bytes.fromhex("6dbea301")

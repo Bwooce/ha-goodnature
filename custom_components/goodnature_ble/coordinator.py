@@ -24,6 +24,7 @@ from homeassistant.util import dt as dt_util
 
 from .const import (
     A24_FAILED_SYNC_RETRY_SECONDS,
+    A24_MAX_SYNC_BACKOFF_SECONDS,
     A24_MIN_SYNC_INTERVAL_SECONDS,
     A24_RECONNECT_GUARD_SECONDS,
     A24_SYNC_WINDOW_SECONDS,
@@ -102,6 +103,9 @@ C20_CHARGE_STATE = ("NOT_CHARGING", "CHARGING", "NO_DATA")
 C20_USB_STATE = ("DISCONNECTED", "CONNECTED", "NO_DATA")
 C20_STRIKER_SOURCE = ("TRIGGER", "UNUSED", "USER", "NO_DATA")
 
+# Kill records stamped before this (2017-07-14) mean the trap's clock was not set.
+MIN_PLAUSIBLE_EPOCH = 1_500_000_000
+
 # Fields of TrapState that are saved across restarts. An A24 can stay silent
 # for days, so without this every restart would blank its sensors.
 PERSISTED_FIELDS = (
@@ -122,6 +126,7 @@ PERSISTED_FIELDS = (
     "adv_flags",
     "last_seen",
     "last_sync",
+    "kill_baseline_from_advert",
 )
 DATETIME_FIELDS = {"last_strike_at", "last_seen", "last_sync"}
 
@@ -173,6 +178,9 @@ class TrapState:
     last_strike_at: datetime | None = None
     strike_temperature_c: int | None = None
     kill_alert: bool = False
+    # True while the only known kill count came from an advert, which carries
+    # just the low 8 bits; the first GATT read then sets the count silently.
+    kill_baseline_from_advert: bool = False
 
     # A24 advertisement status
     adv_flags: int | None = None
@@ -185,6 +193,7 @@ class TrapState:
     # A24 sync bookkeeping
     last_sync: datetime | None = None
     last_sync_attempt: datetime | None = None
+    consecutive_sync_failures: int = 0
     sync_requested: bool = False
 
     # C20
@@ -239,6 +248,7 @@ class GoodnatureCoordinator(DataUpdateCoordinator[None]):
         self.a24_failed_sync_retry = timedelta(seconds=A24_FAILED_SYNC_RETRY_SECONDS)
         self.a24_reconnect_guard = timedelta(seconds=A24_RECONNECT_GUARD_SECONDS)
         self.a24_sync_window = timedelta(seconds=A24_SYNC_WINDOW_SECONDS)
+        self.a24_max_sync_backoff = timedelta(seconds=A24_MAX_SYNC_BACKOFF_SECONDS)
 
         self.state = TrapState(address=self.address, name=self.name)
         self._store: Store[dict[str, Any]] = Store(
@@ -405,9 +415,14 @@ class GoodnatureCoordinator(DataUpdateCoordinator[None]):
             self._apply_kill_count(
                 self._expand_low8(adv.kill_count_low8), source="advertisement"
             )
-            if adv.unread_kills and state.kill_displayed is not None:
-                # Unread kills on the trap: request a sync even inside the
-                # minimum interval.
+            if adv.unread_kills:
+                # Kills nobody has acknowledged on the trap, even on first
+                # contact: alert, and sync even inside the minimum interval.
+                if not state.kill_alert:
+                    self.logger.info(
+                        "%s: trap reports %s unread kill(s)", self.name, adv.unread_kills
+                    )
+                state.kill_alert = True
                 state.sync_requested = True
             return
 
@@ -417,15 +432,26 @@ class GoodnatureCoordinator(DataUpdateCoordinator[None]):
             self._set_model_family(MODEL_A24, source="ibeacon")
             state.serial_number = state.serial_number or serial
 
-    def _expand_low8(self, low8: int) -> int:
-        """Expand the advertised low 8 bits of the kill count using the known count."""
+    def _expand_low8(self, low8: int) -> int | None:
+        """Expand the advertised low 8 bits of the kill count using the known count.
+
+        Only a forward step of less than 128 is accepted; anything else (a lower
+        value, a reset, a garbled advert) returns None and is left for the next
+        GATT read, which carries the full count.
+        """
         known = self.state.kill_displayed
         if known is None:
             return low8
-        candidate = (known & ~0xFF) | low8
-        if candidate < known:
-            candidate += 0x100
-        return candidate
+        step = (low8 - (known & 0xFF)) & 0xFF
+        if step >= 0x80:
+            self.logger.debug(
+                "%s: ignoring advertised kill byte %s (known count %s)",
+                self.name,
+                low8,
+                known,
+            )
+            return None
+        return known + step
 
     @callback
     def _apply_kill_count(self, count: int | None, *, source: str) -> None:
@@ -435,9 +461,30 @@ class GoodnatureCoordinator(DataUpdateCoordinator[None]):
         """
         if count is None:
             return
-        previous = self.state.kill_displayed
-        if previous is not None and count > previous:
-            self.state.kill_alert = True
+        state = self.state
+        previous = state.kill_displayed
+        if previous is None:
+            state.kill_displayed = count
+            state.kill_baseline_from_advert = source == "advertisement"
+            return
+        if source == "gatt":
+            if state.kill_baseline_from_advert:
+                # The baseline held only the low 8 bits; take the full count
+                # without alerting.
+                state.kill_baseline_from_advert = False
+                state.kill_displayed = count
+                return
+            if count < previous:
+                self.logger.warning(
+                    "%s: trap kill count went down from %s to %s; using the trap's value",
+                    self.name,
+                    previous,
+                    count,
+                )
+                state.kill_displayed = count
+                return
+        if count > previous:
+            state.kill_alert = True
             self.logger.info(
                 "%s: kill count went from %s to %s (%s)",
                 self.name,
@@ -445,8 +492,7 @@ class GoodnatureCoordinator(DataUpdateCoordinator[None]):
                 count,
                 source,
             )
-        if previous is None or count >= previous:
-            self.state.kill_displayed = count
+            state.kill_displayed = count
 
     def _update_model_from_advertisement(
         self, service_info: BluetoothServiceInfoBleak
@@ -544,8 +590,14 @@ class GoodnatureCoordinator(DataUpdateCoordinator[None]):
             return False
         if self._last_disconnect and now - self._last_disconnect < self.a24_reconnect_guard:
             return False
-        if state.last_sync_attempt and now - state.last_sync_attempt < self.a24_failed_sync_retry:
-            return False
+        if state.last_sync_attempt and state.consecutive_sync_failures:
+            # Back off after failures: 1, 2, 4 ... up to 30 minutes.
+            backoff = min(
+                self.a24_failed_sync_retry * 2 ** (state.consecutive_sync_failures - 1),
+                self.a24_max_sync_backoff,
+            )
+            if now - state.last_sync_attempt < backoff:
+                return False
         if state.sync_requested or state.last_sync is None:
             return True
         return now - state.last_sync >= self.a24_min_sync_interval
@@ -586,12 +638,14 @@ class GoodnatureCoordinator(DataUpdateCoordinator[None]):
                 result = await ops.run(
                     write_time=self.write_time_on_connect,
                     now=dt_util.utcnow(),
+                    known_record=state.last_strike_id,
                 )
                 self._apply_a24_session(result)
                 state.last_sync = dt_util.utcnow()
                 state.last_gatt_poll = state.last_sync
                 state.last_gatt_error = None
                 state.sync_requested = False
+                state.consecutive_sync_failures = 0
                 self.logger.debug(
                     "A24 sync for %s (%s) done, ack confirmed=%s: %s",
                     self.address,
@@ -602,6 +656,7 @@ class GoodnatureCoordinator(DataUpdateCoordinator[None]):
                 return True
             except Exception as err:  # noqa: BLE001
                 state.gatt_failures += 1
+                state.consecutive_sync_failures += 1
                 state.last_gatt_error = str(err) or type(err).__name__
                 self.logger.debug(
                     "A24 sync failed for %s (%s): %r; steps: %s",
@@ -633,18 +688,44 @@ class GoodnatureCoordinator(DataUpdateCoordinator[None]):
             state.battery_volts = a24_battery_volts(result["battery_raw"])
         if result.get("battery_ir") is not None:
             state.battery_internal_resistance = result["battery_ir"]
+        kill_displayed = result.get("kill_displayed")
         record = result.get("record")
         if record is not None:
-            state.d30d_raw = record.raw_hex
-            state.last_strike_id = record.record_number
-            state.last_strike_at = record.strike_at
-            state.strike_temperature_c = record.temperature_c
-            state.last_activation = record.strike_at or state.last_activation
-        self._apply_kill_count(result.get("kill_displayed"), source="gatt")
+            if self._record_is_plausible(record, kill_displayed):
+                state.d30d_raw = record.raw_hex
+                state.last_strike_id = record.record_number
+                state.last_strike_at = record.strike_at
+                state.strike_temperature_c = record.temperature_c
+            else:
+                self.logger.debug(
+                    "%s: ignoring kill record %s (kill count %s)",
+                    self.name,
+                    record,
+                    kill_displayed,
+                )
+        unacked_before = result.get("kill_read_before")
+        if (
+            kill_displayed is not None
+            and unacked_before is not None
+            and unacked_before < kill_displayed
+        ):
+            # Kills the trap held as unread before this sync acknowledged them.
+            state.kill_alert = True
+        self._apply_kill_count(kill_displayed, source="gatt")
         if result.get("kill_read") is not None:
             state.kill_read = result["kill_read"]
         if result.get("acknowledged"):
             state.unread_kills = 0
+
+    @staticmethod
+    def _record_is_plausible(record: Any, kill_displayed: int | None) -> bool:
+        """Accept a kill record only if it is the newest and its time is sane."""
+        if kill_displayed is not None and record.record_number != kill_displayed:
+            return False
+        if record.strike_at is None:
+            return False
+        stamp = record.strike_at.timestamp()
+        return MIN_PLAUSIBLE_EPOCH <= stamp <= dt_util.utcnow().timestamp() + 120
 
     async def async_manual_poll(self) -> bool:
         """Sync now if the trap is awake, otherwise on its next wake-up."""
@@ -1199,19 +1280,24 @@ class A24Session:
         self.steps.append(f"read {short_id} {bytes(value).hex()}")
         return bytes(value)
 
-    async def _write(self, short_id: str, value: bytes) -> None:
+    async def _write(self, short_id: str, value: bytes) -> bool:
         try:
             await self._client.write_gatt_char(U[short_id], value, response=True)
-        except Exception as err:
+        except Exception as err:  # noqa: BLE001
             self.steps.append(f"write {short_id} {value.hex()} failed: {err!r}")
-            raise
+            return False
         self.steps.append(f"write {short_id} {value.hex()} ok")
+        return True
 
-    async def run(self, *, write_time: bool, now: datetime) -> dict[str, Any]:
+    async def run(
+        self, *, write_time: bool, now: datetime, known_record: int | None = None
+    ) -> dict[str, Any]:
         """Run the session and return what was read.
 
-        Raises if the kill count cannot be read or a kill record cannot be
-        fetched; in that case nothing has been acknowledged.
+        Raises only if the kill count (D20D) cannot be read. Any later failure
+        is recorded and the session still ends with the time and "sync done",
+        because an unacknowledged trap keeps waking up to report, which costs
+        battery; the kill count and acknowledgement do not depend on the record.
         """
         result: dict[str, Any] = {"acknowledged": False}
 
@@ -1223,19 +1309,26 @@ class A24Session:
 
         result["serial"] = serial_from_bytes(await self._read("DE12"))
         result["firmware"] = firmware_from_bytes(await self._read("DE15"))
-        result["kill_read"] = parse_u16_le(await self._read("D60D"))
+        kill_read = parse_u16_le(await self._read("D60D"))
+        result["kill_read_before"] = kill_read
+        result["kill_read"] = kill_read
         result["battery_raw"] = parse_u8(await self._read("FAD1"))
         result["battery_ir"] = parse_u8(await self._read("FAD2"))
 
-        if kill_displayed > 0:
-            selector = kill_displayed.to_bytes(2, "little")
-            await self._write("D20D", selector)
-            record = parse_d30d(await self._read("D30D"))
-            if record is None:
-                raise RuntimeError("Could not read the newest kill record (D30D)")
-            result["record"] = record
-            if result["kill_read"] != kill_displayed:
-                await self._write("D60D", selector)
+        selector = kill_displayed.to_bytes(2, "little")
+        already_have_record = kill_read == kill_displayed and known_record == kill_displayed
+        if kill_displayed > 0 and not already_have_record:
+            if await self._write("D20D", selector):
+                record = parse_d30d(await self._read("D30D"))
+                if record is None:
+                    result["record_error"] = "no kill record returned (D30D)"
+                else:
+                    result["record"] = record
+            else:
+                result["record_error"] = "kill record selection (D20D) refused"
+
+        if kill_displayed > 0 and kill_read != kill_displayed:
+            if await self._write("D60D", selector):
                 result["kill_read"] = kill_displayed
 
         if write_time:
@@ -1243,10 +1336,6 @@ class A24Session:
 
         # "Sync done". The trap often hangs up before confirming this write,
         # which is the normal end of a session, not a failure.
-        try:
-            await self._write("DE13", bytes([A24_CONTROL_SYNC_DONE]))
-            result["ack_confirmed"] = True
-        except Exception:  # noqa: BLE001
-            result["ack_confirmed"] = False
+        result["ack_confirmed"] = await self._write("DE13", bytes([A24_CONTROL_SYNC_DONE]))
         result["acknowledged"] = True
         return result

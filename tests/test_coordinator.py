@@ -107,6 +107,7 @@ async def test_sync_policy(hass: HomeAssistant) -> None:
     assert not coordinator._should_sync_a24(now)  # app's 6 s reconnect guard
     coordinator._last_disconnect = None
 
+    state.consecutive_sync_failures = 1
     state.last_sync_attempt = now - timedelta(seconds=30)
     assert not coordinator._should_sync_a24(now)  # failed-sync backoff
     state.last_sync_attempt = now - timedelta(seconds=61)
@@ -200,3 +201,76 @@ async def test_no_reload_when_model_known_at_setup(hass: HomeAssistant) -> None:
         await coordinator._async_update_data()
         reload.assert_not_called()
     coordinator.async_shutdown()
+
+
+async def test_lower_advert_kill_byte_is_ignored(hass: HomeAssistant) -> None:
+    coordinator = make_coordinator(hass)
+    coordinator.state.kill_displayed = 26
+    assert coordinator._expand_low8(25) is None
+    assert coordinator._expand_low8(0) is None
+    assert coordinator._expand_low8(27) == 27
+    coordinator._async_handle_ble(service_info(ADV + scan_rsp(25)), BluetoothChange.ADVERTISEMENT)
+    assert coordinator.state.kill_displayed == 26
+    assert coordinator.state.kill_alert is False
+
+
+async def test_gatt_count_can_go_down(hass: HomeAssistant) -> None:
+    coordinator = make_coordinator(hass)
+    coordinator._apply_kill_count(30, source="gatt")
+    coordinator._apply_kill_count(26, source="gatt")
+    assert coordinator.state.kill_displayed == 26
+    assert coordinator.state.kill_alert is False
+
+
+async def test_advert_only_baseline_takes_full_gatt_count_silently(hass: HomeAssistant) -> None:
+    coordinator = make_coordinator(hass)
+    # A trap at 282 kills first heard by advert: low 8 bits = 26.
+    coordinator._async_handle_ble(service_info(ADV + scan_rsp(26)), BluetoothChange.ADVERTISEMENT)
+    assert coordinator.state.kill_baseline_from_advert is True
+    coordinator._apply_kill_count(282, source="gatt")
+    assert coordinator.state.kill_displayed == 282
+    assert coordinator.state.kill_alert is False
+    coordinator._apply_kill_count(283, source="gatt")
+    assert coordinator.state.kill_alert is True
+
+
+async def test_unread_kills_alert_on_first_contact(hass: HomeAssistant) -> None:
+    coordinator = make_coordinator(hass)
+    coordinator._async_handle_ble(service_info(ADV + scan_rsp(26, 2)), BluetoothChange.ADVERTISEMENT)
+    assert coordinator.state.kill_alert is True
+    assert coordinator.state.sync_requested is True
+
+
+async def test_unacknowledged_kills_in_gatt_raise_alert(hass: HomeAssistant) -> None:
+    coordinator = make_coordinator(hass)
+    coordinator._apply_a24_session(
+        {"kill_displayed": 26, "kill_read_before": 24, "kill_read": 26, "acknowledged": True}
+    )
+    assert coordinator.state.kill_alert is True
+
+
+async def test_failed_sync_backoff_doubles_to_30_minutes(hass: HomeAssistant) -> None:
+    coordinator = make_coordinator(hass)
+    coordinator.enable_gatt = True
+    now = dt_util.utcnow()
+    state = coordinator.state
+    state.last_sync_attempt = now
+    for failures, wait in ((1, 60), (2, 120), (3, 240), (6, 1800), (10, 1800)):
+        state.consecutive_sync_failures = failures
+        assert not coordinator._should_sync_a24(now + timedelta(seconds=wait - 1))
+        assert coordinator._should_sync_a24(now + timedelta(seconds=wait + 1))
+
+
+async def test_implausible_kill_record_is_ignored(hass: HomeAssistant) -> None:
+    from custom_components.goodnature_ble.protocol import parse_d30d
+
+    coordinator = make_coordinator(hass)
+    good = parse_d30d(bytes.fromhex("c58fc93be30b00f4c6011a00"))
+    unset_clock = parse_d30d(bytes.fromhex("c58fc93be30b" "10000000" "1a00"))  # 1970
+    coordinator._apply_a24_session({"kill_displayed": 27, "record": good})
+    assert coordinator.state.last_strike_at is None  # not the newest record
+    coordinator._apply_a24_session({"kill_displayed": 26, "record": unset_clock})
+    assert coordinator.state.last_strike_at is None
+    coordinator._apply_a24_session({"kill_displayed": 26, "record": good})
+    assert coordinator.state.last_strike_id == 26
+    assert coordinator.state.strike_temperature_c == 11
